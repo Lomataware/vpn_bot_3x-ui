@@ -259,7 +259,7 @@ class XUIAPI:
             query = "&".join(params)
             return f"vless://{client_uuid}@{host}:{port}?{query}#{remark}"
 
-        elif protocol == "hysteria2":
+        elif protocol.startswith("hysteria"):
             password = client.get("password") or client.get("id") or ""
             params = []
             if security == "tls":
@@ -307,18 +307,23 @@ class XUIAPI:
             inbounds = inbounds.get("inbounds") or inbounds.get("data") or []
         return [self._normalize_inbound(i) for i in inbounds]
 
+    @staticmethod
+    def _is_hysteria(inb: dict) -> bool:
+        """Hysteria2-инбаунд? 3x-ui сохраняет протокол как 'hysteria' (Hy2 — единственный
+        поддерживаемый вариант), поэтому принимаем любое имя, начинающееся с 'hysteria'."""
+        proto = (inb.get("protocol") or "").lower()
+        return proto.startswith("hysteria")
+
     async def _find_hysteria_in_list(self) -> dict | None:
-        """Ищет hysteria2-инбаунд (в т.ч. с 'hysteria' в remark) в списке панели."""
+        """Ищет hysteria2-инбаунд (протокол 'hysteria'/'hysteria2') в списке панели."""
         for inb in await self._list_inbounds():
-            proto = (inb.get("protocol") or "").lower()
-            remark = (inb.get("remark") or "").lower()
-            if proto == "hysteria2" or (proto.startswith("hysteria") and "2" in proto):
+            if self._is_hysteria(inb):
                 self.hysteria_inbound_id = inb.get("id")
                 logger.info(f"3x-ui: найден Hysteria2-инбаунд ID={inb.get('id')} ({inb.get('remark')})")
                 return inb
+        # Фоллбэк: инбаунд с 'hysteria' в названии
         for inb in await self._list_inbounds():
-            if "hysteria" in (inb.get("remark") or "").lower() and \
-               (inb.get("protocol") or "").lower() not in ("vless", "trojan", "shadowsocks"):
+            if "hysteria" in (inb.get("remark") or "").lower():
                 self.hysteria_inbound_id = inb.get("id")
                 return inb
         return None
@@ -351,7 +356,11 @@ class XUIAPI:
                 logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
 
             proto = (obj.get("protocol") or "").lower()
-            if proto == "hysteria2":
+            if self._is_hysteria(obj):
+                return obj
+            if proto and proto not in ("vless", "trojan", "shadowsocks", "vmess", "wireguard"):
+                # 3x-ui может называть протокол 'hysteria' — это и есть Hysteria2
+                self.hysteria_inbound_id = hid
                 return obj
             if proto:
                 logger.warning(
@@ -447,7 +456,7 @@ class XUIAPI:
             if not inb.get("id"):
                 # some versions return no object on add — find it via list
                 for inb_cand in await self._list_inbounds():
-                    if (inb_cand.get("protocol") or "").lower() == "hysteria2":
+                    if self._is_hysteria(inb_cand):
                         inb = inb_cand
                         break
             self.hysteria_inbound_id = inb.get("id")
