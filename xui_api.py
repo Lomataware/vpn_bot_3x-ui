@@ -290,6 +290,10 @@ class XUIAPI:
         (vless + hysteria2), поэтому при наличии subId она всегда в приоритете.
         """
         sub_id = client.get("subId", "")
+        # Важно: ссылка /sub/{subId} отдаёт hysteria2 только если у клиента в
+        # Hysteria2-инбаунде прописан тот же subId. Если subId пуст — панель
+        # не отдаст подписку вовсе (или отдаст только vless), поэтому в этом
+        # случае возвращаем пустую строку и даём фоллбэк на прямые ключи.
         if Config.XUI_SUB_URL and sub_id:
             return f"{Config.XUI_SUB_URL}/{sub_id}"
         direct_link = self._build_direct_link(inbound, client)
@@ -386,13 +390,22 @@ class XUIAPI:
                     f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria-инбаунд сам"
                 )
                 self.hysteria_inbound_id = None
-            # иначе (пустой ответ / неизвестный протокол) — переходим к поиску по списку
+            # Иначе (пустой ответ / неизвестный протокол) — может быть это hysteria,
+            # просто не распознанный по protocol-полю: проверяем remark и переходим
+            # к поиску по списку.
+            if not proto and "hysteria" in (obj.get("remark") or "").lower():
+                self.hysteria_inbound_id = hid
+                return obj
 
-        # 2. Поиск любого hysteria-инбаунда в списке панели
+        # 2. Поиск любого hysteria-инбаунда в списке панели (всегда, даже если
+        # XUI_HYSTERIA_INBOUND_ID задан ошибочно или get-by-id вернул пустой объект)
         if not list_error:
             found = await self._find_hysteria_in_list()
             if found:
                 return found
+        elif self.hysteria_inbound_id:
+            # список недоступен, но ID известен — используем его как есть
+            return {"id": self.hysteria_inbound_id, "protocol": "hysteria2"}
         else:
             return None
 
@@ -496,14 +509,23 @@ class XUIAPI:
         hid = inbound.get("id", self.hysteria_inbound_id)
         self.hysteria_inbound_id = hid
 
+        # subId обязателен: без него панель не включит hysteria2-клиента
+        # в ссылку-подписку /sub/{subId} (проявление бага "нет hysteria в подписке")
+        if not hy_client["subId"]:
+            hy_client["subId"] = secrets.token_hex(8)
+
         if existing:
             updated = dict(existing)
+            # ВАЖНО: всегда принудительно проставляем subId (тот же, что у VLESS-клиента).
+            # Если оставить существующий пустой subId, панель 3x-ui не включит этот
+            # клиент в ссылку-подписку /sub/{subId} — и в подписке будет отсутствовать hysteria2.
+            new_sub_id = sub_id or updated.get("subId") or secrets.token_hex(8)
             updated.update({
                 "password": password,
                 "totalGB": total_bytes,
                 "expiryTime": expiry_ms,
                 "enable": True,
-                "subId": updated.get("subId") or sub_id,
+                "subId": new_sub_id,
             })
             payload = {"id": hid, "settings": json.dumps({"clients": [updated]})}
             key = updated.get("password") or updated.get("id") or email
@@ -585,6 +607,19 @@ class XUIAPI:
                     continue
                 result["checked"] += 1
                 sub_id = c.get("subId") or secrets.token_hex(8)
+                # Если у VLESS-клиента не было subId — запишем сгенерированный,
+                # иначе подписка /sub/{subId} не будет содержать ни одного ключа.
+                if not c.get("subId"):
+                    try:
+                        patched = dict(c)
+                        patched["subId"] = sub_id
+                        await self._post_update_client(
+                            patched.get("id") or patched.get("uuid") or "",
+                            email, patched, 0,
+                        )
+                        logger.info(f"3x-ui sync: выставлен subId для VLESS-клиента {email}")
+                    except Exception as pe:
+                        logger.warning(f"3x-ui sync: не удалось выставить subId для {email}: {pe}")
                 expiry_ms = c.get("expiryTime") or 0
                 total_bytes = c.get("totalGB") or 0
                 tg_id = c.get("tgId") or 0
@@ -870,6 +905,48 @@ class XUIAPI:
                 hy_client = self._find_client_in_inbound(hy_inbound, email)
                 if hy_client:
                     hysteria_link = self._build_direct_link(hy_inbound, hy_client)
+                    #Самоизлечение: если у hysteria-клиента пустой или отличающийся subId,
+                    #подписка /sub/{subId} не отдаст hysteria2 — починим на лету.
+                    hy_sub_id = hy_client.get("subId") or ""
+                    if Config.XUI_ENABLE_HYSTERIA and sub_id and hy_sub_id != sub_id:
+                        try:
+                            fixed = await self._ensure_hysteria_client(
+                                email,
+                                hy_client.get("password") or hy_client.get("id") or "",
+                                hy_client.get("expiryTime") or 0,
+                                hy_client.get("totalGB") or 0,
+                                0,
+                                sub_id,
+                            )
+                            if fixed:
+                                refreshed = await self.get_hysteria_inbound()
+                                rc = self._find_client_in_inbound(refreshed, email) if refreshed else None
+                                if rc:
+                                    hy_client = rc
+                                    hysteria_link = self._build_direct_link(refreshed, hy_client)
+                                    logger.info(f"3x-ui: исправлен subId hysteria-клиента {email}")
+                        except Exception as se:
+                            logger.warning(f"3x-ui: не удалось синхронизировать subId для {email}: {se}")
+                elif Config.XUI_ENABLE_HYSTERIA and sub_id:
+                    #Самоизлечение: hysteria-клиента нет — создаём его с тем же subId,
+                    #чтобы в подписке появилась ссылка hysteria2.
+                    try:
+                        created = await self._ensure_hysteria_client(
+                            email,
+                            secrets.token_urlsafe(18),
+                            client.get("expiryTime") or 0,
+                            client.get("totalGB") or 0,
+                            0,
+                            sub_id,
+                        )
+                        if created:
+                            refreshed = await self.get_hysteria_inbound()
+                            rc = self._find_client_in_inbound(refreshed, email) if refreshed else None
+                            if rc:
+                                hysteria_link = self._build_direct_link(refreshed, rc)
+                                logger.info(f"3x-ui: создан отсутствующий hysteria-клиент {email}")
+                    except Exception as ce:
+                        logger.warning(f"3x-ui: не удалось создать hysteria-клиента {email}: {ce}")
 
             return {
                 "success": True,
@@ -886,7 +963,7 @@ class XUIAPI:
                 "subscription_url": sub_url,
                 "sub_page_url": sub_page_url,
                 "vless_link": vless_link if vless_link.startswith("vless://") else "",
-                "hysteria_link": hysteria_link,
+                "hysteria_link": hysteria_link if hysteria_link.startswith("hysteria2://") else "",
             }
         except Exception as e:
             logger.error(f"3x-ui get_user({email}) error: {e}")
