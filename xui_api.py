@@ -1014,8 +1014,18 @@ class XUIAPI:
         days: int,
         existing_username: str = None,
         data_limit_gb: int = None,
+        extend_from: str = "auto",
     ) -> dict:
-        """Создает нового клиента в 3x-ui или продлевает существующего."""
+        """Создает нового клиента в 3x-ui или продлевает существующего.
+
+        Args:
+            days: количество дней подписки.
+            extend_from: стратегия вычисления нового срока:
+                "auto"    — от остатка текущей подписки (классическое продление;
+                            если срок уже истек — от текущей даты);
+                "expire"  — всегда прибавлять к текущему сроку;
+                "now"     — всегда считать от текущей даты (полная замена срока).
+        """
         email = existing_username or f"tg_{user_id}"
         limit_gb = data_limit_gb if data_limit_gb is not None else Config.DEFAULT_DATA_LIMIT_GB
         total_bytes = limit_gb * 1024 * 1024 * 1024 if limit_gb > 0 else 0
@@ -1028,7 +1038,14 @@ class XUIAPI:
 
             now_ts = int(datetime.now().timestamp())
             current_expire = user_data.get("expire") or 0
-            base_ts = max(current_expire, now_ts)
+            if extend_from == "now":
+                # Полная замена: срок отсчитывается от текущей даты
+                base_ts = now_ts
+            elif extend_from == "expire":
+                # Всегда прибавляем к текущему сроку (даже если он в прошлом)
+                base_ts = current_expire if current_expire > 0 else now_ts
+            else:  # "auto": продление от остатка; истекшая подписка — от текущего момента
+                base_ts = max(current_expire, now_ts)
             new_expire_sec = base_ts + int(timedelta(days=days).total_seconds())
             new_expire_ms = new_expire_sec * 1000
 

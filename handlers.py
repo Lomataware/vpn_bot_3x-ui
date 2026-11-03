@@ -56,14 +56,26 @@ def _format_links_block(result: dict) -> str:
     return lines
 
 
-async def _activate_user_sub(user_id: int, days: int) -> dict:
-    """Создает или продлевает подписку клиента в 3x-ui."""
+async def _activate_user_sub(
+    user_id: int, days: int, from_now: bool = False, extend_from: str = "auto"
+) -> dict:
+    """Создает или продлевает подписку клиента в 3x-ui.
+
+    Args:
+        days: количество дней.
+        from_now: True — срок считается от текущей даты (новая выдача/полная
+            замена), а не путем прибавления к остатку старой подписки.
+        extend_from: стратегию продления ("auto", "expire", "now").
+    """
     info = get_user_info(user_id)
     existing_email = _row_get(info, "xui_email")
+    if from_now and extend_from == "auto":
+        extend_from = "now"
     result = await xui.create_or_extend_subscription(
         user_id=user_id,
         days=days,
-        existing_username=existing_email
+        existing_username=existing_email,
+        extend_from=extend_from,
     )
     if result["success"]:
         set_user_xui(
@@ -93,7 +105,9 @@ async def issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Использование: /issue <user_id> <days>\nПример: /issue 123456789 30"
+            "Использование: /issue <user_id> <days> [from_now]\n"
+            "Пример: /issue 123456789 30\n"
+            "Флаг from_now — установить срок от текущей даты (не добавлять к остатку)"
         )
         return
     try:
@@ -103,7 +117,8 @@ async def issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ user_id и days должны быть целыми числами.")
         return
 
-    result = await _activate_user_sub(user_id, days)
+    from_now = len(context.args) >= 3 and context.args[2].lower() in ("from_now", "now")
+    result = await _activate_user_sub(user_id, days, from_now=from_now)
     if result["success"]:
         action_word = "продлена" if result.get("extended") else "активирована"
         expire_str = datetime.fromtimestamp(result["expire"]).strftime("%d.%m.%Y %H:%M")
@@ -150,7 +165,7 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = payment["user_id"]
-    result = await _activate_user_sub(user_id, 30)
+    result = await _activate_user_sub(user_id, Config.MONTH_DAYS)
     if result["success"]:
         if not update_payment_status(payment_id, "approved", result["username"]):
             await update.message.reply_text("⚠️ Платеж уже был обработан.")
@@ -281,7 +296,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["selected_plan"] = {
                 "name": "1 месяц",
                 "price": Config.PRICE_1_MONTH,
-                "days": 30
+                "days": Config.MONTH_DAYS
             }
             text = (
                 f"📦 Тариф: <b>1 месяц</b>\n"
@@ -293,7 +308,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "pay_manual":
             await query.answer()
             plan = context.user_data.get(
-                "selected_plan", {"name": "1 месяц", "price": Config.PRICE_1_MONTH}
+                "selected_plan",
+                {"name": "1 месяц", "price": Config.PRICE_1_MONTH, "days": Config.MONTH_DAYS},
             )
             payment_id = save_payment(user.id, plan.get("name"), plan.get("price"), "card")
             text = (
@@ -315,7 +331,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "pay_crypto":
             await query.answer()
             plan = context.user_data.get(
-                "selected_plan", {"name": "1 месяц", "price": Config.PRICE_1_MONTH}
+                "selected_plan",
+                {"name": "1 месяц", "price": Config.PRICE_1_MONTH, "days": Config.MONTH_DAYS},
             )
             result = await crypto_bot.create_invoice(
                 amount=plan.get("price"),
@@ -384,7 +401,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = result["status"]
             if status == "paid":
                 await query.answer("Оплата получена! Активируем подписку...")
-                mr = await _activate_user_sub(user.id, 30)
+                mr = await _activate_user_sub(user.id, plan.get("days", Config.MONTH_DAYS))
                 if mr["success"]:
                     update_payment_status(payment_id, "paid", mr["username"])
                     mark_trial_used(user.id)
