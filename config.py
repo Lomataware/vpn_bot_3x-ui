@@ -37,6 +37,8 @@ class Config:
     # ===== TRIAL & PRICES =====
     TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3"))
     PRICE_1_MONTH = int(os.getenv("PRICE_1_MONTH", "100"))
+    # Длительность тарифа «1 месяц» в днях (по умолчанию 30, а не календарный месяц)
+    MONTH_DAYS = int(os.getenv("MONTH_DAYS", "30"))
 
     # ===== ADMIN COMMANDS =====
     ADDITIONAL_ADMINS = [
