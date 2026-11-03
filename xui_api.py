@@ -341,9 +341,16 @@ class XUIAPI:
         return obj
 
     async def get_hysteria_inbound(self) -> dict | None:
-        """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui."""
+        """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui.
+
+        3x-ui сохраняет протокол Hysteria2 как 'hysteria' — такие инбаунды считаются
+        валидными. Если инбаунд с указанным ID имеет другой протокол (vless/trojan/...) —
+        ID игнорируется и выполняется поиск настоящего hysteria-инбаунда по списку.
+        """
         if not Config.XUI_ENABLE_HYSTERIA:
             return None
+
+        other_protos = ("vless", "trojan", "shadowsocks", "vmess", "wireguard", "dokodemo-door")
 
         # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
         if self.hysteria_inbound_id:
@@ -357,32 +364,17 @@ class XUIAPI:
 
             proto = (obj.get("protocol") or "").lower()
             if self._is_hysteria(obj):
+                # 3x-ui называет протокол 'hysteria' — это и есть Hysteria2
                 return obj
-            if proto and proto not in ("vless", "trojan", "shadowsocks", "vmess", "wireguard"):
-                # 3x-ui может называть протокол 'hysteria' — это и есть Hysteria2
-                self.hysteria_inbound_id = hid
-                return obj
-            if proto:
+            if proto in other_protos:
                 logger.warning(
                     f"3x-ui: XUI_HYSTERIA_INBOUND_ID={hid} указывает на инбаунд "
-                    f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria2-инбаунд сам"
+                    f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria-инбаунд сам"
                 )
                 self.hysteria_inbound_id = None
-            else:
-                # Инбаунд с таким ID не найден (пустой ответ / нет такого ID) —
-                # пробуем найти настоящий hysteria2-инбаунд в списке
-                try:
-                    found = await self._find_hysteria_in_list()
-                    if found:
-                        return found
-                    logger.warning(
-                        f"3x-ui: инбаунд с ID={hid} не найден и hysteria2-инбаундов в списке нет"
-                    )
-                except Exception as e:
-                    logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
-                    return None
+            # иначе (пустой ответ / неизвестный протокол) — переходим к поиску по списку
 
-        # 2. Поиск любого hysteria2-инбаунда в списке
+        # 2. Поиск любого hysteria-инбаунда в списке панели
         try:
             found = await self._find_hysteria_in_list()
             if found:
@@ -452,9 +444,9 @@ class XUIAPI:
         }
         res = await self._request("POST", "/panel/api/inbounds/add", json=payload)
         if res.get("success"):
-            inb = res.get("obj") or {}
-            if not inb.get("id"):
-                # some versions return no object on add — find it via list
+            inb = self._normalize_inbound(res.get("obj") or {})
+            if not inb.get("id") or not self._is_hysteria(inb):
+                # некоторые версии 3x-ui не возвращают объект при add — находим по списку
                 for inb_cand in await self._list_inbounds():
                     if self._is_hysteria(inb_cand):
                         inb = inb_cand
