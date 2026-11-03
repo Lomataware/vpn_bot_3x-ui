@@ -1,0 +1,241 @@
+From a7118bb1c7f347bc62e3d32fa6e3cca1e855a24f Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 3 Nov 2026 19:32:10 +0000
+Subject: [PATCH 1/3] =?UTF-8?q?fix:=20=D1=80=D0=B0=D1=81=D0=BF=D0=BE=D0=B7?=
+ =?UTF-8?q?=D0=BD=D0=B0=D0=B2=D0=B0=D1=82=D1=8C=20=D0=BF=D1=80=D0=BE=D1=82?=
+ =?UTF-8?q?=D0=BE=D0=BA=D0=BE=D0=BB=20'hysteria'=20(3x-ui)=20=D0=BA=D0=B0?=
+ =?UTF-8?q?=D0=BA=20Hysteria2-=D0=B8=D0=BD=D0=B1=D0=B0=D1=83=D0=BD=D0=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ xui_api.py | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/xui_api.py b/xui_api.py
+index 88c8277..a46b7d7 100644
+--- a/xui_api.py
++++ b/xui_api.py
+@@ -259,7 +259,7 @@ class XUIAPI:
+             query = "&".join(params)
+             return f"vless://{client_uuid}@{host}:{port}?{query}#{remark}"
+ 
+-        elif protocol == "hysteria2":
++        elif protocol.startswith("hysteria"):
+             password = client.get("password") or client.get("id") or ""
+             params = []
+             if security == "tls":
+@@ -307,18 +307,23 @@ class XUIAPI:
+             inbounds = inbounds.get("inbounds") or inbounds.get("data") or []
+         return [self._normalize_inbound(i) for i in inbounds]
+ 
++    @staticmethod
++    def _is_hysteria(inb: dict) -> bool:
++        """Hysteria2-инбаунд? 3x-ui сохраняет протокол как 'hysteria' (Hy2 — единственный
++        поддерживаемый вариант), поэтому принимаем любое имя, начинающееся с 'hysteria'."""
++        proto = (inb.get("protocol") or "").lower()
++        return proto.startswith("hysteria")
++
+     async def _find_hysteria_in_list(self) -> dict | None:
+-        """Ищет hysteria2-инбаунд (в т.ч. с 'hysteria' в remark) в списке панели."""
++        """Ищет hysteria2-инбаунд (протокол 'hysteria'/'hysteria2') в списке панели."""
+         for inb in await self._list_inbounds():
+-            proto = (inb.get("protocol") or "").lower()
+-            remark = (inb.get("remark") or "").lower()
+-            if proto == "hysteria2" or (proto.startswith("hysteria") and "2" in proto):
++            if self._is_hysteria(inb):
+                 self.hysteria_inbound_id = inb.get("id")
+                 logger.info(f"3x-ui: найден Hysteria2-инбаунд ID={inb.get('id')} ({inb.get('remark')})")
+                 return inb
++        # Фоллбэк: инбаунд с 'hysteria' в названии
+         for inb in await self._list_inbounds():
+-            if "hysteria" in (inb.get("remark") or "").lower() and \
+-               (inb.get("protocol") or "").lower() not in ("vless", "trojan", "shadowsocks"):
++            if "hysteria" in (inb.get("remark") or "").lower():
+                 self.hysteria_inbound_id = inb.get("id")
+                 return inb
+         return None
+@@ -351,7 +356,11 @@ class XUIAPI:
+                 logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
+ 
+             proto = (obj.get("protocol") or "").lower()
+-            if proto == "hysteria2":
++            if self._is_hysteria(obj):
++                return obj
++            if proto and proto not in ("vless", "trojan", "shadowsocks", "vmess", "wireguard"):
++                # 3x-ui может называть протокол 'hysteria' — это и есть Hysteria2
++                self.hysteria_inbound_id = hid
+                 return obj
+             if proto:
+                 logger.warning(
+@@ -447,7 +456,7 @@ class XUIAPI:
+             if not inb.get("id"):
+                 # some versions return no object on add — find it via list
+                 for inb_cand in await self._list_inbounds():
+-                    if (inb_cand.get("protocol") or "").lower() == "hysteria2":
++                    if self._is_hysteria(inb_cand):
+                         inb = inb_cand
+                         break
+             self.hysteria_inbound_id = inb.get("id")
+-- 
+2.39.5
+
+
+From cab7a3c4ce902cab7dfabe2e7908aaf2f4fb986d Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 3 Nov 2026 19:35:27 +0000
+Subject: [PATCH 2/3] fix(hysteria): treat 3x-ui protocol 'hysteria' as valid
+ Hysteria2 inbound (get-by-id path), never return None when hy inbound exists
+
+---
+ xui_api.py | 40 ++++++++++++++++------------------------
+ 1 file changed, 16 insertions(+), 24 deletions(-)
+
+diff --git a/xui_api.py b/xui_api.py
+index a46b7d7..816fe50 100644
+--- a/xui_api.py
++++ b/xui_api.py
+@@ -341,10 +341,17 @@ class XUIAPI:
+         return obj
+ 
+     async def get_hysteria_inbound(self) -> dict | None:
+-        """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui."""
++        """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui.
++
++        3x-ui сохраняет протокол Hysteria2 как 'hysteria' — такие инбаунды считаются
++        валидными. Если инбаунд с указанным ID имеет другой протокол (vless/trojan/...) —
++        ID игнорируется и выполняется поиск настоящего hysteria-инбаунда по списку.
++        """
+         if not Config.XUI_ENABLE_HYSTERIA:
+             return None
+ 
++        other_protos = ("vless", "trojan", "shadowsocks", "vmess", "wireguard", "dokodemo-door")
++
+         # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
+         if self.hysteria_inbound_id:
+             hid = self.hysteria_inbound_id
+@@ -357,32 +364,17 @@ class XUIAPI:
+ 
+             proto = (obj.get("protocol") or "").lower()
+             if self._is_hysteria(obj):
++                # 3x-ui называет протокол 'hysteria' — это и есть Hysteria2
+                 return obj
+-            if proto and proto not in ("vless", "trojan", "shadowsocks", "vmess", "wireguard"):
+-                # 3x-ui может называть протокол 'hysteria' — это и есть Hysteria2
+-                self.hysteria_inbound_id = hid
+-                return obj
+-            if proto:
++            if proto in other_protos:
+                 logger.warning(
+                     f"3x-ui: XUI_HYSTERIA_INBOUND_ID={hid} указывает на инбаунд "
+-                    f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria2-инбаунд сам"
++                    f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria-инбаунд сам"
+                 )
+                 self.hysteria_inbound_id = None
+-            else:
+-                # Инбаунд с таким ID не найден (пустой ответ / нет такого ID) —
+-                # пробуем найти настоящий hysteria2-инбаунд в списке
+-                try:
+-                    found = await self._find_hysteria_in_list()
+-                    if found:
+-                        return found
+-                    logger.warning(
+-                        f"3x-ui: инбаунд с ID={hid} не найден и hysteria2-инбаундов в списке нет"
+-                    )
+-                except Exception as e:
+-                    logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
+-                    return None
++            # иначе (пустой ответ / неизвестный протокол) — переходим к поиску по списку
+ 
+-        # 2. Поиск любого hysteria2-инбаунда в списке
++        # 2. Поиск любого hysteria-инбаунда в списке панели
+         try:
+             found = await self._find_hysteria_in_list()
+             if found:
+@@ -452,9 +444,9 @@ class XUIAPI:
+         }
+         res = await self._request("POST", "/panel/api/inbounds/add", json=payload)
+         if res.get("success"):
+-            inb = res.get("obj") or {}
+-            if not inb.get("id"):
+-                # some versions return no object on add — find it via list
++            inb = self._normalize_inbound(res.get("obj") or {})
++            if not inb.get("id") or not self._is_hysteria(inb):
++                # некоторые версии 3x-ui не возвращают объект при add — находим по списку
+                 for inb_cand in await self._list_inbounds():
+                     if self._is_hysteria(inb_cand):
+                         inb = inb_cand
+-- 
+2.39.5
+
+
+From 63d1536a87bbd8ea6045ca3be668ac891b1e0537 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 3 Nov 2026 19:46:52 +0000
+Subject: [PATCH 3/3] fix(hysteria): find hysteria2 inbound via inbounds list
+ instead of unreliable get-by-id (some 3x-ui versions return empty obj)
+
+---
+ xui_api.py | 33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/xui_api.py b/xui_api.py
+index 816fe50..722e0fa 100644
+--- a/xui_api.py
++++ b/xui_api.py
+@@ -352,15 +352,29 @@ class XUIAPI:
+ 
+         other_protos = ("vless", "trojan", "shadowsocks", "vmess", "wireguard", "dokodemo-door")
+ 
++        # Получаем полный список инбаундов один раз — он надёжнее точечного get-by-id
++        # (некоторые версии 3x-ui возвращают пустой/урезанный объект из /inbounds/get/{id})
+         # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
+-        if self.hysteria_inbound_id:
++        list_error = None
++        inb_list: list[dict] = []
++        try:
++            inb_list = await self._list_inbounds()
++        except Exception as e:
++            list_error = e
++            logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
++
++        # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
++        if self.hysteria_inbound_id and not list_error:
+             hid = self.hysteria_inbound_id
+-            obj = {}
+-            try:
+-                res = await self._request("GET", f"/panel/api/inbounds/get/{hid}")
+-                obj = self._normalize_inbound(res.get("obj") or {})
+-            except Exception as e:
+-                logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
++            obj = next((i for i in inb_list if i.get("id") == hid), None)
++            if obj is None:
++                # fallback: точечный запрос, если по какой-то причине нет в списке
++                try:
++                    res = await self._request("GET", f"/panel/api/inbounds/get/{hid}")
++                    obj = self._normalize_inbound(res.get("obj") or {})
++                except Exception as e:
++                    logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
++                    obj = {}
+ 
+             proto = (obj.get("protocol") or "").lower()
+             if self._is_hysteria(obj):
+@@ -375,12 +389,11 @@ class XUIAPI:
+             # иначе (пустой ответ / неизвестный протокол) — переходим к поиску по списку
+ 
+         # 2. Поиск любого hysteria-инбаунда в списке панели
+-        try:
++        if not list_error:
+             found = await self._find_hysteria_in_list()
+             if found:
+                 return found
+-        except Exception as e:
+-            logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
++        else:
+             return None
+ 
+         # 3. Авто-создание
+-- 
+2.39.5
+
