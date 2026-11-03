@@ -2,9 +2,9 @@
 # =============================================================================
 # Автоматическая установка VPN-сервера (3x-ui + Telegram-бот) на Ubuntu 22.04/24.04:
 #   - Установка 3x-ui (MHSanaei/3x-ui)
-#   - Принудительная установка порта 2053, логина/пароля и SSL через x-ui CLI + SQLite
+#   - Очистка дублей в settings и принудительная установка порта 2053, логина/пароля и SSL
 #   - Включение HTTPS для панели (2053) и сервиса подписок (2096)
-#   - Автоматическое создание инбаунда VLESS + XTLS-Vision + Reality на 443/tcp
+#   - Автоматическое создание инбаунда VLESS + XTLS-Vision + Reality на 443/tcp (с CSRF)
 #   - Автокопирование файлов бота из текущей директории в /root/vpn_bot/vpntg
 # =============================================================================
 set -euo pipefail
@@ -92,25 +92,25 @@ fi
 
 systemctl stop x-ui 2>/dev/null || true
 
-# Принудительно задаем логин, пароль, порт 2053 и корневой путь через CLI 3x-ui
+# Задаем логин, пароль, порт 2053 и корневой путь через CLI 3x-ui
 /usr/local/x-ui/x-ui setting -username "${XUI_ADMIN_USER}" -password "${XUI_ADMIN_PASS}" -port "${XUI_PORT}" -webBasePath "/" >/dev/null 2>&1 || true
 
-# Записываем настройки порта, путей и SSL-сертификатов напрямую в БД 3x-ui
+# Удаляем старые ключи перед вставкой (в таблице settings колонка key не имеет UNIQUE)
 sqlite3 /etc/x-ui/x-ui.db <<SQL
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webPort', '${XUI_PORT}');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webBasePath', '/');
-DELETE FROM settings WHERE key = 'webListen';
-INSERT OR REPLACE INTO settings (key, value) VALUES ('subEnable', 'true');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('subPort', '${XUI_SUB_PORT}');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('subPath', '/sub/');
+DELETE FROM settings WHERE key IN ('webPort', 'webBasePath', 'webListen', 'subEnable', 'subPort', 'subPath', 'webCertFile', 'webKeyFile', 'subCertFile', 'subKeyFile');
+INSERT INTO settings (key, value) VALUES ('webPort', '${XUI_PORT}');
+INSERT INTO settings (key, value) VALUES ('webBasePath', '/');
+INSERT INTO settings (key, value) VALUES ('subEnable', 'true');
+INSERT INTO settings (key, value) VALUES ('subPort', '${XUI_SUB_PORT}');
+INSERT INTO settings (key, value) VALUES ('subPath', '/sub/');
 SQL
 
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
   sqlite3 /etc/x-ui/x-ui.db <<SQL
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webCertFile', '/etc/letsencrypt/live/${DOMAIN}/fullchain.pem');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('webKeyFile', '/etc/letsencrypt/live/${DOMAIN}/privkey.pem');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('subCertFile', '/etc/letsencrypt/live/${DOMAIN}/fullchain.pem');
-INSERT OR REPLACE INTO settings (key, value) VALUES ('subKeyFile', '/etc/letsencrypt/live/${DOMAIN}/privkey.pem');
+INSERT INTO settings (key, value) VALUES ('webCertFile', '/etc/letsencrypt/live/${DOMAIN}/fullchain.pem');
+INSERT INTO settings (key, value) VALUES ('webKeyFile', '/etc/letsencrypt/live/${DOMAIN}/privkey.pem');
+INSERT INTO settings (key, value) VALUES ('subCertFile', '/etc/letsencrypt/live/${DOMAIN}/fullchain.pem');
+INSERT INTO settings (key, value) VALUES ('subKeyFile', '/etc/letsencrypt/live/${DOMAIN}/privkey.pem');
 SQL
 fi
 
@@ -123,8 +123,8 @@ sleep 4
 log "Настройка инбаунда VLESS + Reality в 3x-ui"
 XRAY_BIN="$(find /usr/local/x-ui/bin -name 'xray-linux-*' | head -n1)"
 REALITY_KEYS="$("$XRAY_BIN" x25519)"
-REALITY_PRIV="$(echo "$REALITY_KEYS" | grep -i 'private' | awk '{print $NF}' | tr -d '\r')"
-REALITY_PUB="$(echo "$REALITY_KEYS" | grep -iE 'public|password' | head -n1 | awk '{print $NF}' | tr -d '\r')"
+REALITY_PRIV="$(echo "$REALITY_KEYS" | grep -i 'private' | awk -F':' '{print $NF}' | tr -d ' \r')"
+REALITY_PUB="$(echo "$REALITY_KEYS" | grep -iE 'public|password' | head -n1 | awk -F':' '{print $NF}' | tr -d ' \r')"
 
 PROTOCOL_SCHEME="http"
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
@@ -132,16 +132,23 @@ if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
 fi
 
 COOKIE_JAR="$(mktemp)"
+CSRF_TOKEN=""
 for _ in $(seq 1 10); do
-  if curl -s -k -c "$COOKIE_JAR" -X POST "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/login" \
+  CSRF_TOKEN="$(curl -s -k -c "$COOKIE_JAR" -b "$COOKIE_JAR" "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/csrf-token" | jq -r '.obj // empty' 2>/dev/null || true)"
+  if curl -s -k -c "$COOKIE_JAR" -b "$COOKIE_JAR" -X POST "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/login" \
+    -H "X-CSRF-Token: ${CSRF_TOKEN}" \
     -d "username=${XUI_ADMIN_USER}&password=${XUI_ADMIN_PASS}" | grep -q '"success":true'; then
     break
   fi
   sleep 2
 done
 
-EXISTING_INBOUNDS="$(curl -s -k -b "$COOKIE_JAR" "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/list" | jq '.obj | length' 2>/dev/null || echo "0")"
-if [[ "${EXISTING_INBOUNDS:-0}" -eq 0 ]]; then
+EXISTING_INBOUNDS="$(curl -s -k -b "$COOKIE_JAR" "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/list" | jq -r '(.obj | length) // 0' 2>/dev/null || echo "0")"
+if [[ ! "$EXISTING_INBOUNDS" =~ ^[0-9]+$ ]]; then
+  EXISTING_INBOUNDS=0
+fi
+
+if [[ "$EXISTING_INBOUNDS" -eq 0 ]]; then
   SETTINGS_JSON="$(jq -cn '{clients: [], decryption: "none", fallbacks: []}')"
   STREAM_JSON="$(jq -cn \
     --arg dest "${REALITY_DEST}:443" \
@@ -199,8 +206,9 @@ if [[ "${EXISTING_INBOUNDS:-0}" -eq 0 ]]; then
 
   curl -s -k -b "$COOKIE_JAR" -X POST "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/add" \
     -H "Content-Type: application/json" \
-    -d "$INBOUND_PAYLOAD" >/dev/null || warn "Не удалось автоматически добавить инбаунд"
-  log "Инбаунд VLESS + Reality (порт 443, ID=1) успешно создан!"
+    -H "X-CSRF-Token: ${CSRF_TOKEN}" \
+    -d "$INBOUND_PAYLOAD" >/dev/null || warn "Не удалось создать инбаунд через curl (бот создаст его автоматически при первом запросе)"
+  log "Инбаунд VLESS + Reality (порт 443, ID=1) успешно настроен!"
 else
   log "Инбаунд в 3x-ui уже существует, пропускаем создание."
 fi

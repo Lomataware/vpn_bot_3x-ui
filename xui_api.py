@@ -1,4 +1,7 @@
 import json
+import os
+import sqlite3
+import subprocess
 import uuid
 import secrets
 import logging
@@ -10,68 +13,184 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+def _parse_json_field(value, default=None):
+    """Безопасно парсит поле, которое может быть JSON-строкой (3x-ui v2) или dict (3x-ui v3)."""
+    if default is None:
+        default = {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else default
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return default
+    return default
+
+
 class XUIAPI:
-    """Асинхронный клиент для работы с панелью 3x-ui (MHSanaei/3x-ui)."""
+    """Асинхронный клиент для работы с панелью 3x-ui (совместим с v2.x и v3.x)."""
 
     def __init__(self):
         self.base_url = Config.XUI_URL.rstrip("/")
         self.username = Config.XUI_USERNAME
         self.password = Config.XUI_PASSWORD
         self.inbound_id = Config.XUI_INBOUND_ID
-        self.cookies = None
+        self.cookies = {}
+        self.csrf_token = None
         self.cookie_expires = None
 
-    async def _login(self) -> bool:
-        """Авторизация в 3x-ui и сохранение сессионной cookie."""
+    def _discover_local_xui_urls(self) -> list[str]:
+        """Формирует список резервных URL панели (чтение /etc/x-ui/x-ui.db и смена http/https)."""
+        candidates = [self.base_url]
+        if self.base_url.startswith("http://"):
+            candidates.append("https://" + self.base_url[len("http://"):])
+        elif self.base_url.startswith("https://"):
+            candidates.append("http://" + self.base_url[len("https://"):])
+
+        db_path = "/etc/x-ui/x-ui.db"
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path, timeout=5.0)
+                rows = conn.execute("SELECT key, value FROM settings").fetchall()
+                conn.close()
+                # Первое вхождение ключа — то, которое читает GORM в 3x-ui
+                first_settings = {}
+                for k, v in rows:
+                    if k not in first_settings:
+                        first_settings[k] = v
+                port = first_settings.get("webPort") or "2053"
+                base_path = (first_settings.get("webBasePath") or "/").strip()
+                if not base_path.startswith("/"):
+                    base_path = "/" + base_path
+                base_path = base_path.rstrip("/")
+                has_cert = bool(first_settings.get("webCertFile"))
+                schemes = ["https", "http"] if has_cert else ["http", "https"]
+                for sch in schemes:
+                    url = f"{sch}://127.0.0.1:{port}{base_path}".rstrip("/")
+                    if url not in candidates:
+                        candidates.append(url)
+            except Exception as e:
+                logger.debug(f"Не удалось прочитать {db_path}: {e}")
+        return candidates
+
+    async def _fetch_csrf(self, client: httpx.AsyncClient, base_url: str):
+        """Получает CSRF-токен для 3x-ui v3.0+ (если эндпоинт поддерживается)."""
         try:
-            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            resp = await client.get(f"{base_url}/csrf-token")
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("obj") or data.get("csrfToken") or resp.headers.get("X-CSRF-Token")
+                if token and isinstance(token, str):
+                    self.csrf_token = token
+            for name, val in resp.cookies.items():
+                if "csrf" in name.lower() and not self.csrf_token:
+                    self.csrf_token = val
+        except Exception:
+            pass
+
+    async def _try_login_url(self, target_url: str) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=12.0, verify=False, follow_redirects=True) as client:
+                await self._fetch_csrf(client, target_url)
+                headers = {"X-Requested-With": "XMLHttpRequest"}
+                if self.csrf_token:
+                    headers["X-CSRF-Token"] = self.csrf_token
+
                 response = await client.post(
-                    f"{self.base_url}/login",
+                    f"{target_url}/login",
                     data={"username": self.username, "password": self.password},
+                    headers=headers,
                 )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    self.cookies = response.cookies
-                    self.cookie_expires = datetime.now() + timedelta(hours=11)
-                    logger.info("3x-ui: успешная авторизация")
-                    return True
-                logger.error(f"3x-ui: ошибка входа: {data.get('msg')}")
-            else:
-                logger.error(f"3x-ui: HTTP {response.status_code} при авторизации")
+
+                if response.status_code in (400, 403, 415):
+                    await self._fetch_csrf(client, target_url)
+                    if self.csrf_token:
+                        headers["X-CSRF-Token"] = self.csrf_token
+                    response = await client.post(
+                        f"{target_url}/login",
+                        json={"username": self.username, "password": self.password},
+                        headers=headers,
+                    )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("success"):
+                        merged_cookies = {}
+                        for k, v in client.cookies.items():
+                            merged_cookies[k] = v
+                        for k, v in response.cookies.items():
+                            merged_cookies[k] = v
+                        await self._fetch_csrf(client, target_url)
+                        for k, v in client.cookies.items():
+                            merged_cookies[k] = v
+                        self.cookies = merged_cookies
+                        self.base_url = target_url
+                        self.cookie_expires = datetime.now() + timedelta(hours=6)
+                        logger.info(f"3x-ui: успешная авторизация ({self.base_url})")
+                        return True
+                    logger.error(f"3x-ui: отказ при входе ({target_url}): {data.get('msg')}")
+                else:
+                    logger.warning(f"3x-ui: HTTP {response.status_code} при авторизации ({target_url})")
         except Exception as e:
-            logger.error(f"3x-ui: исключение при авторизации: {e}")
+            logger.warning(f"3x-ui: ошибка подключения к {target_url}: {e}")
+        return False
+
+    async def _login(self) -> bool:
+        """Авторизация в 3x-ui с автоопределением схемы/пути и сохранением сессионных cookies."""
+        for candidate_url in self._discover_local_xui_urls():
+            if await self._try_login_url(candidate_url):
+                return True
         return False
 
     async def _ensure_auth(self):
         if self.cookies and self.cookie_expires and datetime.now() < self.cookie_expires:
             return
         if not await self._login():
-            raise RuntimeError("Не удалось авторизоваться в панели 3x-ui")
+            raise RuntimeError("Не удалось авторизоваться в панели 3x-ui (проверьте XUI_URL, логин и пароль)")
+
+    def _build_headers(self, extra: dict = None) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        if extra:
+            headers.update(extra)
+        return headers
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         """Выполняет запрос к API 3x-ui с автоматическим переподключением при истечении сессии."""
         await self._ensure_auth()
         url = f"{self.base_url}{path}"
+        req_headers = self._build_headers(kwargs.pop("headers", None))
+
         async with httpx.AsyncClient(timeout=15.0, verify=False, cookies=self.cookies) as client:
-            response = await client.request(method, url, **kwargs)
-            # Если сессия истекла, пробуем перелогиниться один раз
+            response = await client.request(method, url, headers=req_headers, **kwargs)
+            if response.headers.get("X-CSRF-Token"):
+                self.csrf_token = response.headers["X-CSRF-Token"]
+
             if response.status_code in (401, 403, 302, 307) or "login" in str(response.url):
-                await self._login()
-                response = await client.request(method, url, cookies=self.cookies, **kwargs)
+                if await self._login():
+                    url = f"{self.base_url}{path}"
+                    req_headers = self._build_headers()
+                    async with httpx.AsyncClient(timeout=15.0, verify=False, cookies=self.cookies) as retry_client:
+                        response = await retry_client.request(method, url, headers=req_headers, **kwargs)
 
         if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+            raise RuntimeError(f"HTTP {response.status_code} ({path}): {response.text[:200]}")
 
         try:
             return response.json()
         except Exception:
-            # Возможно, сессия слетела и вернулась HTML-страница логина
             if await self._login():
-                async with httpx.AsyncClient(timeout=15.0, verify=False, cookies=self.cookies) as client:
-                    response = await client.request(method, url, **kwargs)
+                url = f"{self.base_url}{path}"
+                req_headers = self._build_headers()
+                async with httpx.AsyncClient(timeout=15.0, verify=False, cookies=self.cookies) as retry_client:
+                    response = await retry_client.request(method, url, headers=req_headers, **kwargs)
                 return response.json()
-            raise RuntimeError("Некорректный JSON-ответ от 3x-ui")
+            raise RuntimeError(f"Некорректный JSON-ответ от 3x-ui ({path})")
 
     def _resolve_host(self) -> str:
         if Config.XUI_PUBLIC_HOST:
@@ -79,34 +198,26 @@ class XUIAPI:
         parsed = urlparse(self.base_url)
         return parsed.hostname or "127.0.0.1"
 
-    def _build_client_link(self, inbound: dict, client: dict) -> str:
-        """Формирует ссылку подписки или прямую ссылку (VLESS / Hysteria2 / Trojan / VMess) из настроек инбаунда 3x-ui."""
-        sub_id = client.get("subId", "")
-        if Config.XUI_SUB_URL and sub_id:
-            return f"{Config.XUI_SUB_URL}/{sub_id}"
-
+    def _build_direct_link(self, inbound: dict, client: dict) -> str:
+        """Формирует прямую ссылку подключения (vless://, hysteria2://, trojan://)."""
         protocol = (inbound.get("protocol") or "vless").lower()
         port = inbound.get("port", 443)
         host = self._resolve_host()
         remark = quote(f"{Config.SERVER_LABEL} ({client.get('email', 'VPN')})")
 
-        try:
-            stream = json.loads(inbound.get("streamSettings") or "{}")
-        except json.JSONDecodeError:
-            stream = {}
-
+        stream = _parse_json_field(inbound.get("streamSettings"))
         network = stream.get("network", "tcp")
         security = stream.get("security", "none")
 
         if protocol == "vless":
-            client_uuid = client.get("id", "")
+            client_uuid = client.get("id") or client.get("uuid") or ""
             params = [f"type={network}", "encryption=none"]
 
             if security == "reality":
                 params.append("security=reality")
                 reality = stream.get("realitySettings") or {}
                 r_settings = reality.get("settings") or {}
-                pbk = r_settings.get("publicKey", "")
+                pbk = r_settings.get("publicKey") or reality.get("publicKey") or ""
                 fp = r_settings.get("fingerprint") or "chrome"
                 spx = r_settings.get("spiderX") or "/"
                 server_names = reality.get("serverNames") or [""]
@@ -115,34 +226,34 @@ class XUIAPI:
                 sid = short_ids[0] if short_ids else ""
 
                 if pbk:
-                    params.append(f"pbk={quote(pbk)}")
+                    params.append(f"pbk={quote(str(pbk))}")
                 if fp:
-                    params.append(f"fp={quote(fp)}")
+                    params.append(f"fp={quote(str(fp))}")
                 if sni:
-                    params.append(f"sni={quote(sni)}")
+                    params.append(f"sni={quote(str(sni))}")
                 if sid:
-                    params.append(f"sid={quote(sid)}")
+                    params.append(f"sid={quote(str(sid))}")
                 if spx:
-                    params.append(f"spx={quote(spx)}")
+                    params.append(f"spx={quote(str(spx))}")
             elif security == "tls":
                 params.append("security=tls")
                 tls_settings = stream.get("tlsSettings") or {}
                 server_name = tls_settings.get("serverName") or host
-                params.append(f"sni={quote(server_name)}")
+                params.append(f"sni={quote(str(server_name))}")
 
             flow = client.get("flow", "")
             if flow:
-                params.append(f"flow={quote(flow)}")
+                params.append(f"flow={quote(str(flow))}")
 
             if network == "ws":
                 ws = stream.get("wsSettings") or {}
                 path = ws.get("path", "/")
-                params.append(f"path={quote(path)}")
+                params.append(f"path={quote(str(path))}")
             elif network == "grpc":
                 grpc = stream.get("grpcSettings") or {}
                 service_name = grpc.get("serviceName", "")
                 if service_name:
-                    params.append(f"serviceName={quote(service_name)}")
+                    params.append(f"serviceName={quote(str(service_name))}")
 
             query = "&".join(params)
             return f"vless://{client_uuid}@{host}:{port}?{query}#{remark}"
@@ -151,26 +262,167 @@ class XUIAPI:
             password = client.get("password") or client.get("id") or ""
             tls_settings = stream.get("tlsSettings") or {}
             sni = tls_settings.get("serverName") or host
-            return f"hysteria2://{quote(password)}@{host}:{port}?sni={quote(sni)}&insecure=0#{remark}"
+            return f"hysteria2://{quote(str(password))}@{host}:{port}?sni={quote(str(sni))}&insecure=0#{remark}"
 
         elif protocol == "trojan":
             password = client.get("password") or client.get("id") or ""
-            return f"trojan://{quote(password)}@{host}:{port}?security={security}&type={network}#{remark}"
+            return f"trojan://{quote(str(password))}@{host}:{port}?security={security}&type={network}#{remark}"
 
+        sub_id = client.get("subId", "")
         return f"{self.base_url}/sub/{sub_id}" if sub_id else ""
 
+    def _build_client_link(self, inbound: dict, client: dict) -> str:
+        """Возвращает основную ссылку (прямую vless:// или ссылку подписки XUI_SUB_URL)."""
+        direct_link = self._build_direct_link(inbound, client)
+        sub_id = client.get("subId", "")
+        if direct_link.startswith(("vless://", "hysteria2://", "trojan://")):
+            return direct_link
+        if Config.XUI_SUB_URL and sub_id:
+            return f"{Config.XUI_SUB_URL}/{sub_id}"
+        return direct_link
+
+    async def _generate_x25519_keys(self) -> tuple[str, str]:
+        """Генерирует пару ключей X25519 через API 3x-ui или бинарник xray."""
+        for endpoint in ("/panel/api/server/getNewX25519Cert", "/server/getNewX25519Cert"):
+            try:
+                res = await self._request("POST", endpoint)
+                obj = res.get("obj") or {}
+                priv = obj.get("privateKey")
+                pub = obj.get("publicKey")
+                if priv and pub:
+                    return priv, pub
+            except Exception:
+                pass
+            try:
+                res = await self._request("GET", endpoint)
+                obj = res.get("obj") or {}
+                priv = obj.get("privateKey")
+                pub = obj.get("publicKey")
+                if priv and pub:
+                    return priv, pub
+            except Exception:
+                pass
+
+        # Фоллбэк на локальный бинарник xray
+        try:
+            xray_bins = [
+                "/usr/local/x-ui/bin/xray-linux-amd64",
+                "/usr/local/x-ui/bin/xray-linux-arm64",
+            ]
+            for b in xray_bins:
+                if os.path.exists(b):
+                    out = subprocess.check_output([b, "x25519"], text=True, timeout=5)
+                    priv, pub = "", ""
+                    for line in out.splitlines():
+                        low = line.lower()
+                        if "private" in low:
+                            priv = line.split(":")[-1].strip()
+                        elif "public" in low or "password" in low:
+                            if not pub:
+                                pub = line.split(":")[-1].strip()
+                    if priv and pub:
+                        return priv, pub
+        except Exception as e:
+            logger.warning(f"Не удалось сгенерировать ключи через xray CLI: {e}")
+
+        raise RuntimeError("Не удалось сгенерировать ключи Reality X25519")
+
+    async def _auto_create_default_inbound(self) -> dict:
+        """Автоматически создает инбаунд VLESS + Reality (порт 443), если в панели 0 инбаундов."""
+        priv_key, pub_key = await self._generate_x25519_keys()
+        short_id = secrets.token_hex(8)
+        dest_host = "www.microsoft.com"
+
+        settings_json = json.dumps({
+            "clients": [],
+            "decryption": "none",
+            "fallbacks": []
+        })
+        stream_json = json.dumps({
+            "network": "tcp",
+            "security": "reality",
+            "externalProxy": [],
+            "realitySettings": {
+                "show": False,
+                "xver": 0,
+                "dest": f"{dest_host}:443",
+                "serverNames": [dest_host],
+                "privateKey": priv_key,
+                "minClient": "",
+                "maxClient": "",
+                "maxTimediff": 0,
+                "shortIds": [short_id],
+                "settings": {
+                    "publicKey": pub_key,
+                    "fingerprint": "chrome",
+                    "serverName": "",
+                    "spiderX": "/"
+                }
+            },
+            "tcpSettings": {
+                "acceptProxyProtocol": False,
+                "header": {"type": "none"}
+            }
+        })
+        sniffing_json = json.dumps({
+            "enabled": True,
+            "destOverride": ["http", "tls", "quic", "fakedns"],
+            "metadataOnly": False,
+            "routeOnly": False
+        })
+
+        payload = {
+            "up": 0,
+            "down": 0,
+            "total": 0,
+            "remark": f"{Config.SERVER_LABEL}-VLESS-Reality",
+            "enable": True,
+            "expiryTime": 0,
+            "listen": "",
+            "port": 443,
+            "protocol": "vless",
+            "settings": settings_json,
+            "streamSettings": stream_json,
+            "sniffing": sniffing_json
+        }
+        res = await self._request("POST", "/panel/api/inbounds/add", json=payload)
+        if res.get("success") and res.get("obj"):
+            inb = res["obj"]
+            self.inbound_id = inb.get("id", 1)
+            logger.info(f"3x-ui: автоматически создан инбаунд VLESS+Reality (ID={self.inbound_id})")
+            return inb
+
+        list_res = await self._request("GET", "/panel/api/inbounds/list")
+        inbounds = list_res.get("obj") or []
+        if inbounds:
+            self.inbound_id = inbounds[0]["id"]
+            return inbounds[0]
+        raise RuntimeError(f"Не удалось автоматически создать инбаунд: {res.get('msg')}")
+
     async def get_inbound(self) -> dict:
-        """Получает объект инбаунда по XUI_INBOUND_ID."""
-        res = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
-        if not res.get("success") or not res.get("obj"):
-            raise RuntimeError(res.get("msg") or f"Инбаунд ID={self.inbound_id} не найден")
-        return res["obj"]
+        """Получает объект инбаунда по XUI_INBOUND_ID (или автоматически находит/создает его)."""
+        try:
+            res = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
+            if res.get("success") and res.get("obj"):
+                return res["obj"]
+        except Exception as e:
+            logger.warning(f"3x-ui get/{self.inbound_id} fallback to list: {e}")
+
+        list_res = await self._request("GET", "/panel/api/inbounds/list")
+        inbounds = list_res.get("obj") or []
+        for inb in inbounds:
+            if inb.get("id") == self.inbound_id:
+                return inb
+        if inbounds:
+            self.inbound_id = inbounds[0]["id"]
+            logger.info(f"3x-ui: переключен inbound_id на {self.inbound_id}")
+            return inbounds[0]
+
+        logger.warning("3x-ui: в панели нет инбаундов, запускаю автоматическое создание VLESS+Reality...")
+        return await self._auto_create_default_inbound()
 
     def _find_client_in_inbound(self, inbound: dict, email: str) -> dict | None:
-        try:
-            settings = json.loads(inbound.get("settings") or "{}")
-        except json.JSONDecodeError:
-            return None
+        settings = _parse_json_field(inbound.get("settings"))
         for c in settings.get("clients") or []:
             if c.get("email") == email:
                 return c
@@ -184,11 +436,20 @@ class XUIAPI:
             if not client:
                 return {"success": False, "error": "User not found"}
 
-            # Запрашиваем статистику трафика
-            traffic_res = await self._request(
-                "GET", f"/panel/api/inbounds/getClientTraffics/{email}"
-            )
-            t_obj = traffic_res.get("obj") or {}
+            t_obj = {}
+            for stat in inbound.get("clientStats") or []:
+                if stat.get("email") == email:
+                    t_obj = stat
+                    break
+
+            if not t_obj:
+                try:
+                    traffic_res = await self._request(
+                        "GET", f"/panel/api/inbounds/getClientTraffics/{email}"
+                    )
+                    t_obj = traffic_res.get("obj") or {}
+                except Exception:
+                    t_obj = {}
 
             up = t_obj.get("up") or 0
             down = t_obj.get("down") or 0
@@ -211,13 +472,15 @@ class XUIAPI:
                 status = "disabled"
 
             sub_url = self._build_client_link(inbound, client)
+            sub_id = client.get("subId", "")
+            sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
 
             return {
                 "success": True,
                 "data": {
                     "username": email,
-                    "uuid": client.get("id"),
-                    "sub_id": client.get("subId"),
+                    "uuid": client.get("id") or client.get("uuid"),
+                    "sub_id": sub_id,
                     "status": status,
                     "expire": expire_sec,
                     "used_traffic": used_traffic,
@@ -225,10 +488,34 @@ class XUIAPI:
                     "raw_client": client,
                 },
                 "subscription_url": sub_url,
+                "sub_page_url": sub_page_url,
             }
         except Exception as e:
             logger.error(f"3x-ui get_user({email}) error: {e}")
             return {"success": False, "error": str(e)}
+
+    async def _post_update_client(self, client_uuid: str, email: str, updated_client: dict, user_id: int) -> dict:
+        """Обновляет клиента с автоматическим подбором типа tgId (int для v3 / str для v2)."""
+        for tg_val in (int(user_id) if user_id else 0, str(user_id) if user_id else ""):
+            updated_client["tgId"] = tg_val
+            payload = {
+                "id": self.inbound_id,
+                "settings": json.dumps({"clients": [updated_client]}),
+            }
+            try:
+                res = await self._request(
+                    "POST", f"/panel/api/inbounds/updateClient/{client_uuid}", json=payload
+                )
+                if res.get("success"):
+                    return res
+            except Exception as e:
+                logger.warning(f"updateClient attempt ({type(tg_val).__name__}) error: {e}")
+
+        # Фоллбэк на эндпоинт 3x-ui v3.x
+        updated_client["tgId"] = int(user_id) if user_id else 0
+        return await self._request(
+            "POST", f"/panel/api/clients/update/{quote(email)}", json=updated_client
+        )
 
     async def create_or_extend_subscription(
         self,
@@ -246,7 +533,7 @@ class XUIAPI:
         if existing["success"]:
             user_data = existing["data"]
             raw_client = user_data["raw_client"]
-            client_uuid = raw_client.get("id")
+            client_uuid = raw_client.get("id") or raw_client.get("uuid")
 
             now_ts = int(datetime.now().timestamp())
             current_expire = user_data.get("expire") or 0
@@ -258,36 +545,35 @@ class XUIAPI:
             updated_client["enable"] = True
             updated_client["expiryTime"] = new_expire_ms
             updated_client["totalGB"] = total_bytes
+            if not updated_client.get("subId"):
+                updated_client["subId"] = secrets.token_hex(8)
 
             try:
-                # Сбрасываем использованный трафик при продлении
                 await self._request(
                     "POST",
                     f"/panel/api/inbounds/{self.inbound_id}/resetClientTraffic/{email}",
                 )
-            except Exception as e:
-                logger.warning(f"3x-ui: не удалось сбросить трафик {email}: {e}")
+            except Exception:
+                try:
+                    await self._request("POST", f"/panel/api/clients/resetTraffic/{quote(email)}")
+                except Exception as e:
+                    logger.warning(f"3x-ui: не удалось сбросить трафик {email}: {e}")
 
             try:
-                payload = {
-                    "id": self.inbound_id,
-                    "settings": json.dumps({"clients": [updated_client]}),
-                }
-                res = await self._request(
-                    "POST",
-                    f"/panel/api/inbounds/updateClient/{client_uuid}",
-                    json=payload,
-                )
+                res = await self._post_update_client(client_uuid, email, updated_client, user_id)
                 if res.get("success"):
                     inbound = await self.get_inbound()
                     sub_url = self._build_client_link(inbound, updated_client)
+                    sub_id = updated_client.get("subId", "")
+                    sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
                     logger.info(f"3x-ui: продлена подписка {email} на {days} дн.")
                     return {
                         "success": True,
                         "username": email,
                         "uuid": client_uuid,
-                        "sub_id": updated_client.get("subId", ""),
+                        "sub_id": sub_id,
                         "subscription_url": sub_url,
+                        "sub_page_url": sub_page_url,
                         "expire": new_expire_sec,
                         "data_limit": total_bytes,
                         "extended": True,
@@ -314,12 +600,8 @@ class XUIAPI:
         try:
             inbound = await self.get_inbound()
             protocol = (inbound.get("protocol") or "vless").lower()
-            try:
-                stream = json.loads(inbound.get("streamSettings") or "{}")
-            except json.JSONDecodeError:
-                stream = {}
+            stream = _parse_json_field(inbound.get("streamSettings"))
 
-            # Для VLESS + TCP + Reality/TLS включаем xtls-rprx-vision
             flow = ""
             if protocol == "vless" and stream.get("network") == "tcp" and stream.get("security") in ("reality", "tls"):
                 flow = "xtls-rprx-vision"
@@ -332,19 +614,41 @@ class XUIAPI:
                 "totalGB": total_bytes,
                 "expiryTime": expire_ms,
                 "enable": True,
-                "tgId": str(user_id),
+                "tgId": int(user_id) if user_id else 0,
                 "subId": sub_id,
+                "comment": "",
                 "reset": 0,
             }
 
-            payload = {
-                "id": self.inbound_id,
-                "settings": json.dumps({"clients": [client_obj]}),
-            }
+            res = None
+            for tg_val in (int(user_id) if user_id else 0, str(user_id) if user_id else ""):
+                client_obj["tgId"] = tg_val
+                payload = {
+                    "id": self.inbound_id,
+                    "settings": json.dumps({"clients": [client_obj]}),
+                }
+                try:
+                    res = await self._request("POST", "/panel/api/inbounds/addClient", json=payload)
+                    if res.get("success"):
+                        break
+                except Exception as e:
+                    logger.warning(f"addClient attempt ({type(tg_val).__name__}) error: {e}")
 
-            res = await self._request("POST", "/panel/api/inbounds/addClient", json=payload)
-            if res.get("success"):
+            # Фоллбэк для 3x-ui v3.x (/panel/api/clients/add)
+            if not res or not res.get("success"):
+                v3_client = dict(client_obj)
+                v3_client["uuid"] = client_uuid
+                v3_client["tgId"] = int(user_id) if user_id else 0
+                v3_payload = {"client": v3_client, "inboundIds": [self.inbound_id]}
+                try:
+                    res = await self._request("POST", "/panel/api/clients/add", json=v3_payload)
+                except Exception as v3_err:
+                    if not res:
+                        raise v3_err
+
+            if res and res.get("success"):
                 sub_url = self._build_client_link(inbound, client_obj)
+                sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
                 logger.info(f"3x-ui: создан клиент {email} (UUID={client_uuid})")
                 return {
                     "success": True,
@@ -352,14 +656,15 @@ class XUIAPI:
                     "uuid": client_uuid,
                     "sub_id": sub_id,
                     "subscription_url": sub_url,
+                    "sub_page_url": sub_page_url,
                     "expire": expire_sec,
                     "data_limit": total_bytes,
                     "extended": False,
                 }
             logger.error(f"3x-ui: ошибка создания клиента {email}: {res}")
-            return {"success": False, "error": res.get("msg") or "addClient failed"}
+            return {"success": False, "error": (res or {}).get("msg") or "addClient failed"}
         except Exception as e:
-            logger.error(f"3x-ui: исключение при создании клиента {email}: {e}")
+            logger.error(f"3x-ui: исключение при создании клиента {email}: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def revoke_subscription(self, email: str) -> bool:
@@ -369,15 +674,11 @@ class XUIAPI:
             if not user_res["success"]:
                 return False
             raw_client = dict(user_res["data"]["raw_client"])
-            client_uuid = raw_client.get("id")
+            client_uuid = raw_client.get("id") or raw_client.get("uuid")
             raw_client["enable"] = False
-
-            payload = {
-                "id": self.inbound_id,
-                "settings": json.dumps({"clients": [raw_client]}),
-            }
-            res = await self._request(
-                "POST", f"/panel/api/inbounds/updateClient/{client_uuid}", json=payload
+            tg_id = raw_client.get("tgId") or 0
+            res = await self._post_update_client(
+                client_uuid, email, raw_client, int(tg_id) if str(tg_id).isdigit() else 0
             )
             return bool(res.get("success"))
         except Exception as e:

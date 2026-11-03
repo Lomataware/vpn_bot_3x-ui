@@ -81,7 +81,6 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
         ''')
-        # Безопасные миграции со старой схемы
         for stmt in (
             "ALTER TABLE users ADD COLUMN is_blocked BOOLEAN DEFAULT FALSE",
             "ALTER TABLE users ADD COLUMN trial_used BOOLEAN DEFAULT FALSE",
@@ -203,4 +202,18 @@ def get_payment(payment_id: int):
     with get_db_connection() as conn:
         return conn.execute(
             "SELECT * FROM payments WHERE id = ?", (payment_id,)
+        ).fetchone()
+
+
+def get_payment_by_external_id(external_id: str, user_id: int = None):
+    """Находит платеж по invoice_id CryptoBot (сохраняется даже после перезапуска бота)."""
+    with get_db_connection() as conn:
+        if user_id is not None:
+            return conn.execute(
+                "SELECT * FROM payments WHERE external_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+                (str(external_id), user_id)
+            ).fetchone()
+        return conn.execute(
+            "SELECT * FROM payments WHERE external_id = ? ORDER BY id DESC LIMIT 1",
+            (str(external_id),)
         ).fetchone()

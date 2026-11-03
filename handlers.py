@@ -8,7 +8,8 @@ from telegram.ext import ContextTypes
 from config import Config
 from database import (
     save_user, get_user_info, set_user_xui, has_used_trial, mark_trial_used,
-    get_db_connection, save_payment, update_payment_status, get_payment
+    get_db_connection, save_payment, update_payment_status, get_payment,
+    get_payment_by_external_id
 )
 from keyboards import get_main_menu, get_back_button, get_plans, get_payment_methods
 from xui_api import xui
@@ -28,6 +29,16 @@ def _row_get(row, key, default=None):
 
 def _menu_for_user(user_id: int):
     return get_main_menu(show_trial=not has_used_trial(user_id))
+
+
+def _format_links_block(result: dict) -> str:
+    """Форматирует блок с прямым VLESS-ключом и ссылкой подписки (если задана)."""
+    main_url = result.get("subscription_url", "")
+    sub_page = result.get("sub_page_url", "")
+    lines = f"🔗 <b>Ключ подключения:</b>\n<code>{main_url}</code>\n"
+    if sub_page and sub_page != main_url:
+        lines += f"\n🌐 <b>Ссылка на подписку (Sub URL):</b>\n<code>{sub_page}</code>\n"
+    return lines
 
 
 async def _activate_user_sub(user_id: int, days: int) -> dict:
@@ -54,11 +65,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(update.effective_user)
     user = update.effective_user
     text = (
-        f"👋 Привет, {user.first_name}!
-
-"
-        f"Добро пожаловать в скоростной VPN-сервис на базе 3x-ui.
-"
+        f"👋 Привет, {user.first_name}!\n\n"
+        f"Добро пожаловать в скоростной VPN-сервис на базе 3x-ui.\n"
         f"Выберите нужное действие в меню ниже:"
     )
     await update.message.reply_text(text, reply_markup=_menu_for_user(user.id))
@@ -70,8 +78,7 @@ async def issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Использование: /issue <user_id> <days>
-Пример: /issue 123456789 30"
+            "Использование: /issue <user_id> <days>\nПример: /issue 123456789 30"
         )
         return
     try:
@@ -85,18 +92,13 @@ async def issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result["success"]:
         action_word = "продлена" if result.get("extended") else "активирована"
         expire_str = datetime.fromtimestamp(result["expire"]).strftime("%d.%m.%Y %H:%M")
+        links_block = _format_links_block(result)
         try:
             msg = (
-                f"🎉 <b>Ваша подписка {action_word}!</b>
-
-"
-                f"⏳ Срок: <b>{days} дн.</b> (до <b>{expire_str}</b>)
-"
-                f"🔗 <b>Ключ / ссылка подключения:</b>
-<code>{result['subscription_url']}</code>
-
-"
-                f"Скопируйте ссылку и импортируйте её в Hiddify / v2rayNG / Streisand / Throne."
+                f"🎉 <b>Ваша подписка {action_word}!</b>\n\n"
+                f"⏳ Срок: <b>{days} дн.</b> (до <b>{expire_str}</b>)\n"
+                f"{links_block}\n"
+                f"Скопируйте ключ и импортируйте его в Hiddify / v2rayNG / Streisand / Throne."
             )
             await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
             await update.message.reply_text(
@@ -104,10 +106,8 @@ async def issue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             await update.message.reply_text(
-                f"⚠️ Подписка {action_word}, но не удалось отправить сообщение пользователю: {e}
-"
-                f"Клиент: {result['username']}
-Ссылка: {result['subscription_url']}"
+                f"⚠️ Подписка {action_word}, но не удалось отправить сообщение пользователю: {e}\n"
+                f"Клиент: {result['username']}\nСсылка: {result['subscription_url']}"
             )
     else:
         await update.message.reply_text(f"❌ Ошибка 3x-ui: {result.get('error')}")
@@ -142,25 +142,19 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         mark_trial_used(user_id)
         expire_str = datetime.fromtimestamp(result["expire"]).strftime("%d.%m.%Y")
+        links_block = _format_links_block(result)
         try:
             msg = (
-                f"✅ <b>Оплата подтверждена!</b>
-
-"
-                f"📅 Действует до: <b>{expire_str}</b>
-"
-                f"🔗 <b>Ключ / ссылка подключения:</b>
-<code>{result['subscription_url']}</code>
-
-"
-                f"Импортируйте ссылку в Hiddify / v2rayNG / Streisand."
+                f"✅ <b>Оплата подтверждена!</b>\n\n"
+                f"📅 Действует до: <b>{expire_str}</b>\n"
+                f"{links_block}\n"
+                f"Импортируйте ключ в Hiddify / v2rayNG / Streisand."
             )
             await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
             await update.message.reply_text(f"✅ Платеж #{payment_id} подтвержден для пользователя {user_id}")
         except Exception as e:
             await update.message.reply_text(
-                f"⚠️ Подписка выдана, но отправка ЛС не удалась: {e}
-Ссылка: {result['subscription_url']}"
+                f"⚠️ Подписка выдана, но отправка ЛС не удалась: {e}\nСсылка: {result['subscription_url']}"
             )
     else:
         await update.message.reply_text(f"❌ Ошибка 3x-ui: {result.get('error')}")
@@ -180,15 +174,10 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not payments:
         await update.message.reply_text("✅ Нет ожидающих платежей.")
         return
-    text = f"⏳ <b>Ожидающие платежи ({len(payments)}):</b>
-
-"
+    text = f"⏳ <b>Ожидающие платежи ({len(payments)}):</b>\n\n"
     for p in payments:
         user_info = f"@{p['username']}" if p["username"] else (p["first_name"] or p["user_id"])
-        text += f"#{p['id']} | {user_info} | {p['amount']} ₽ | {p['method']}
-👉 /approve {p['id']}
-
-"
+        text += f"#{p['id']} | {user_info} | {p['amount']} ₽ | {p['method']}\n👉 /approve {p['id']}\n\n"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -216,8 +205,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with get_db_connection() as conn:
                     conn.execute("UPDATE users SET is_blocked = TRUE WHERE id = ?", (row[0],))
             logger.error(f"Broadcast error {row[0]}: {e}")
-    await update.message.reply_text(f"✅ Отправлено: {sent}
-❌ Ошибок: {failed}")
+    await update.message.reply_text(f"✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
 
 
 # ===== Обработчик inline-кнопок =====
@@ -242,17 +230,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result["success"]:
                 mark_trial_used(user.id)
                 expire_str = datetime.fromtimestamp(result["expire"]).strftime("%d.%m.%Y %H:%M")
+                links_block = _format_links_block(result)
                 text = (
-                    f"🎁 <b>Пробный период на {Config.TRIAL_DAYS} дн. активирован!</b>
-
-"
-                    f"📅 Действует до: <b>{expire_str}</b>
-"
-                    f"🔗 <b>Ключ / ссылка подключения:</b>
-<code>{result['subscription_url']}</code>
-
-"
-                    f"Скопируйте ссылку и добавьте в приложение Hiddify / v2rayNG / Streisand."
+                    f"🎁 <b>Пробный период на {Config.TRIAL_DAYS} дн. активирован!</b>\n\n"
+                    f"📅 Действует до: <b>{expire_str}</b>\n"
+                    f"{links_block}\n"
+                    f"Скопируйте ключ и добавьте в приложение Hiddify / v2rayNG / Streisand."
                 )
                 await query.edit_message_text(
                     text,
@@ -260,24 +243,20 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=get_back_button("main_menu")
                 )
             else:
+                logger.error(f"Free trial creation failed for {user.id}: {result.get('error')}")
                 await query.edit_message_text(
-                    "❌ Не удалось создать тестовую подписку. Попробуйте позже или напишите в поддержку.",
+                    f"❌ Не удалось создать тестовую подписку ({result.get('error')}). "
+                    f"Попробуйте позже или напишите в поддержку @{Config.SUPPORT_USERNAME}.",
                     reply_markup=get_back_button("main_menu")
                 )
 
         elif data == "buy_subscription":
             await query.answer()
             text = (
-                "💳 <b>Покупка подписки</b>
-
-"
-                "🚀 Высокая скорость и минимальный пинг.
-"
-                "🛡 Современные протоколы обхода блокировок на базе 3x-ui.
-"
-                "📱 Поддержка всех устройств (Android, iOS, Windows, macOS, Linux).
-
-"
+                "💳 <b>Покупка подписки</b>\n\n"
+                "🚀 Высокая скорость и минимальный пинг.\n"
+                "🛡 Современные протоколы обхода блокировок на базе 3x-ui.\n"
+                "📱 Поддержка всех устройств (Android, iOS, Windows, macOS, Linux).\n\n"
                 "Выберите тарифный план:"
             )
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=get_plans())
@@ -290,11 +269,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "days": 30
             }
             text = (
-                f"📦 Тариф: <b>1 месяц</b>
-"
-                f"💰 Стоимость: <b>{Config.PRICE_1_MONTH} ₽</b>
-
-"
+                f"📦 Тариф: <b>1 месяц</b>\n"
+                f"💰 Стоимость: <b>{Config.PRICE_1_MONTH} ₽</b>\n\n"
                 f"Выберите удобный способ оплаты:"
             )
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=get_payment_methods())
@@ -306,27 +282,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             payment_id = save_payment(user.id, plan.get("name"), plan.get("price"), "card")
             text = (
-                f"💳 <b>Оплата переводом</b>
-
-"
-                f"📦 Тариф: <b>{plan.get('name')}</b>
-"
-                f"💰 К оплате: <b>{plan.get('price')} ₽</b>
-"
-                f"🆔 Номер заказа: <code>#{payment_id}</code>
-
-"
-                f"🏦 <b>Реквизиты для перевода:</b>
-"
-                f"• <b>Банк:</b> {Config.BANK_NAME}
-"
-                f"• <b>Номер / СБП:</b> <code>{Config.SUPPORT_PHONE}</code>
-
-"
+                f"💳 <b>Оплата переводом</b>\n\n"
+                f"📦 Тариф: <b>{plan.get('name')}</b>\n"
+                f"💰 К оплате: <b>{plan.get('price')} ₽</b>\n"
+                f"🆔 Номер заказа: <code>#{payment_id}</code>\n\n"
+                f"🏦 <b>Реквизиты для перевода:</b>\n"
+                f"• <b>Банк:</b> {Config.BANK_NAME}\n"
+                f"• <b>Номер / СБП:</b> <code>{Config.SUPPORT_PHONE}</code>\n\n"
                 f"После оплаты отправьте чек в поддержку @{Config.SUPPORT_USERNAME} "
-                f"и укажите номер заказа: <code>#{payment_id}</code>
-
-"
+                f"и укажите номер заказа: <code>#{payment_id}</code>\n\n"
                 f"Подписка будет активирована сразу после проверки."
             )
             await query.edit_message_text(
@@ -358,25 +322,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]
                 ])
                 text = (
-                    f"💎 <b>Оплата криптовалютой</b>
-
-"
-                    f"📦 Тариф: <b>{plan.get('name')}</b>
-"
-                    f"💰 Сумма: <b>{result.get('amount')} {result.get('currency', 'RUB')}</b>
-"
-                    f"🆔 Заказ: <code>#{payment_id}</code>
-
-"
+                    f"💎 <b>Оплата криптовалютой</b>\n\n"
+                    f"📦 Тариф: <b>{plan.get('name')}</b>\n"
+                    f"💰 Сумма: <b>{result.get('amount')} {result.get('currency', 'RUB')}</b>\n"
+                    f"🆔 Заказ: <code>#{payment_id}</code>\n\n"
                     f"Нажмите кнопку ниже для оплаты, затем нажмите «Проверить оплату»."
                 )
                 await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
             else:
                 logger.error(f"CryptoBot create_invoice failed: {result.get('error')}")
                 text = (
-                    "⚠️ <b>Ошибка создания счета CryptoBot</b>
-
-"
+                    "⚠️ <b>Ошибка создания счета CryptoBot</b>\n\n"
                     "<i>Пожалуйста, выберите другой способ оплаты или обратитесь в поддержку.</i>"
                 )
                 await query.edit_message_text(
@@ -389,40 +345,41 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, IndexError):
                 await query.answer("Некорректный счет", show_alert=True)
                 return
-            invoice = context.user_data.get("active_invoice", {})
-            if not invoice or invoice.get("invoice_id") != invoice_id:
-                await query.answer("Счет не найден в активной сессии", show_alert=True)
+
+            payment_record = get_payment_by_external_id(str(invoice_id), user.id)
+            if not payment_record:
+                invoice = context.user_data.get("active_invoice", {})
+                if invoice and invoice.get("invoice_id") == invoice_id:
+                    payment_record = get_payment(invoice["payment_id"])
+
+            if not payment_record:
+                await query.answer("Счет не найден в базе данных", show_alert=True)
                 return
-            payment_id = invoice["payment_id"]
-            payment_record = get_payment(payment_id)
-            if payment_record and payment_record["status"] in ("paid", "approved"):
-                await query.answer("Этот счет уже оплачен!", show_alert=True)
+
+            payment_id = payment_record["id"]
+            if payment_record["status"] in ("paid", "approved"):
+                await query.answer("Этот счет уже оплачен и активирован!", show_alert=True)
                 return
+
             result = await crypto_bot.get_invoice(invoice_id)
             if not result["success"]:
-                await query.answer("Ошибка проверки счета", show_alert=True)
+                await query.answer("Ошибка проверки счета в CryptoBot", show_alert=True)
                 return
+
             status = result["status"]
             if status == "paid":
-                if not update_payment_status(payment_id, "paid", f"tg_{user.id}"):
-                    await query.answer("Платеж уже обрабатывается.", show_alert=True)
-                    return
                 await query.answer("Оплата получена! Активируем подписку...")
                 mr = await _activate_user_sub(user.id, 30)
                 if mr["success"]:
+                    update_payment_status(payment_id, "paid", mr["username"])
                     mark_trial_used(user.id)
                     expire_str = datetime.fromtimestamp(mr["expire"]).strftime("%d.%m.%Y")
+                    links_block = _format_links_block(mr)
                     text = (
-                        f"✅ <b>Оплата прошла успешно!</b>
-
-"
-                        f"📅 Подписка до: <b>{expire_str}</b>
-"
-                        f"🔗 <b>Ключ / ссылка подключения:</b>
-<code>{mr['subscription_url']}</code>
-
-"
-                        f"Скопируйте ссылку и добавьте в Hiddify / v2rayNG / Streisand."
+                        f"✅ <b>Оплата прошла успешно!</b>\n\n"
+                        f"📅 Подписка до: <b>{expire_str}</b>\n"
+                        f"{links_block}\n"
+                        f"Скопируйте ключ и добавьте в Hiddify / v2rayNG / Streisand."
                     )
                     await query.edit_message_text(
                         text,
@@ -430,7 +387,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=get_back_button("main_menu")
                     )
                 else:
-                    await query.edit_message_text(f"❌ Ошибка выдачи подписки: {mr.get('error')}")
+                    logger.error(f"3x-ui activation failed after CryptoBot payment #{payment_id}: {mr.get('error')}")
+                    await query.answer(
+                        f"Оплата получена, но 3x-ui вернул ошибку: {mr.get('error')}. Попробуйте нажать кнопку еще раз.",
+                        show_alert=True
+                    )
             elif status == "active":
                 await query.answer("Счет еще не оплачен.", show_alert=True)
             elif status == "expired":
@@ -445,18 +406,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             email = _row_get(info, "xui_email")
             username_disp = f"@{user.username}" if user.username else "не указан"
             text = (
-                f"👤 <b>Личный кабинет</b>
-
-"
-                f"🆔 ID: <code>{user.id}</code>
-"
-                f"🙍‍♂️ Имя: {user.full_name}
-"
-                f"📧 Username: {username_disp}
-"
-                f"📅 Регистрация: {str(created)[:10]}
-
-"
+                f"👤 <b>Личный кабинет</b>\n\n"
+                f"🆔 ID: <code>{user.id}</code>\n"
+                f"🙍‍♂️ Имя: {user.full_name}\n"
+                f"📧 Username: {username_disp}\n"
+                f"📅 Регистрация: {str(created)[:10]}\n\n"
             )
             keyboard_rows = []
             if email:
@@ -467,16 +421,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     expire = d.get("expire")
                     status_emoji = "🟢" if status == "active" else "🔴"
                     expire_str = datetime.fromtimestamp(expire).strftime("%d.%m.%Y") if expire else "безлимит"
-                    text += f"{status_emoji} <b>Статус подписки:</b> {status} (до {expire_str})
-"
+                    text += f"{status_emoji} <b>Статус подписки:</b> {status} (до {expire_str})\n"
                     keyboard_rows.append([InlineKeyboardButton("📊 Детали трафика", callback_data="sub_info")])
                     keyboard_rows.append([InlineKeyboardButton("🔗 Получить ключ подключения", callback_data="resend_link")])
                 else:
-                    text += "⚪ <b>Статус подписки:</b> не найдена в панели
-"
+                    text += "⚪ <b>Статус подписки:</b> не найдена в панели\n"
             else:
-                text += "⚪ <b>Статус подписки:</b> нет активной подписки
-"
+                text += "⚪ <b>Статус подписки:</b> нет активной подписки\n"
 
             keyboard_rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
             await query.edit_message_text(
@@ -503,15 +454,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = d.get("status", "unknown")
             status_emoji = "🟢" if status == "active" else "🔴"
             text = (
-                f"📊 <b>Информация о подписке</b>
-
-"
-                f"{status_emoji} <b>Статус:</b> {status}
-"
-                f"⏳ <b>Истекает:</b> {expire_str}
-"
-                f"📈 <b>Трафик:</b> {used:.2f} ГБ / {limit_str}
-"
+                f"📊 <b>Информация о подписке</b>\n\n"
+                f"{status_emoji} <b>Статус:</b> {status}\n"
+                f"⏳ <b>Истекает:</b> {expire_str}\n"
+                f"📈 <b>Трафик:</b> {used:.2f} ГБ / {limit_str}\n"
             )
             await query.edit_message_text(
                 text, parse_mode=ParseMode.HTML, reply_markup=get_back_button("my_account")
@@ -526,15 +472,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud = await xui.get_user(email)
             if ud["success"] and ud.get("subscription_url"):
                 await query.answer()
-                full_url = ud["subscription_url"]
+                links_block = _format_links_block(ud)
                 text = (
-                    f"🔗 <b>Ваш ключ подключения:</b>
-
-"
-                    f"<code>{full_url}</code>
-
-"
-                    f"Скопируйте ссылку и импортируйте в Hiddify / v2rayNG / Streisand / v2rayN."
+                    f"{links_block}\n"
+                    f"Скопируйте ключ и импортируйте в Hiddify / v2rayNG / Streisand / v2rayN."
                 )
                 await query.edit_message_text(
                     text, parse_mode=ParseMode.HTML, reply_markup=get_back_button("my_account")
@@ -545,47 +486,28 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "terms":
             await query.answer()
             text = (
-                "📜 <b>Правила использования сервиса</b>
-
-"
-                "1. Запрещено использование торрентов (BitTorrent заблокирован на уровне сервера).
-"
-                "2. Запрещена рассылка спама, DDoS-атаки и любая противоправная активность.
-"
-                "3. Ключ предназначен для личного использования.
-"
-                "4. Поддержка отвечает в течение 24 часов.
-"
-                "5. При нарушении правил доступ аннулируется без возврата средств.
-"
+                "📜 <b>Правила использования сервиса</b>\n\n"
+                "1. Запрещено использование торрентов (BitTorrent заблокирован на уровне сервера).\n"
+                "2. Запрещена рассылка спама, DDoS-атаки и любая противоправная активность.\n"
+                "3. Ключ предназначен для личного использования.\n"
+                "4. Поддержка отвечает в течение 24 часов.\n"
+                "5. При нарушении правил доступ аннулируется без возврата средств.\n"
             )
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=get_back_button())
 
         elif data == "help":
             await query.answer()
             text = (
-                "🆘 <b>Помощь и подключение</b>
-
-"
-                f"👨‍💻 <b>Поддержка:</b> @{Config.SUPPORT_USERNAME}
-
-"
-                "<b>Как подключиться:</b>
-"
-                "1. Получите пробный доступ или оплатите подписку в боте.
-"
-                "2. Скопируйте выданный ключ (нажмите на него).
-"
-                "3. Установите клиент для вашей ОС и добавьте ключ из буфера обмена:
-"
-                "   • <b>Hiddify</b> (Android / iOS / Windows / macOS / Linux)
-"
-                "   • <b>v2rayNG</b> (Android)
-"
-                "   • <b>Streisand / V2Box</b> (iOS)
-"
-                "   • <b>v2rayN / Throne</b> (Windows / Linux)
-"
+                "🆘 <b>Помощь и подключение</b>\n\n"
+                f"👨‍💻 <b>Поддержка:</b> @{Config.SUPPORT_USERNAME}\n\n"
+                "<b>Как подключиться:</b>\n"
+                "1. Получите пробный доступ или оплатите подписку в боте.\n"
+                "2. Скопируйте выданный ключ (нажмите на него).\n"
+                "3. Установите клиент для вашей ОС и добавьте ключ из буфера обмена:\n"
+                "   • <b>Hiddify</b> (Android / iOS / Windows / macOS / Linux)\n"
+                "   • <b>v2rayNG</b> (Android)\n"
+                "   • <b>Streisand / V2Box</b> (iOS)\n"
+                "   • <b>v2rayN / Throne</b> (Windows / Linux)\n"
             )
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=get_back_button())
 
@@ -618,18 +540,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pend = conn.execute("SELECT COUNT(*) FROM payments WHERE status = 'pending'").fetchone()[0]
         paid = conn.execute("SELECT COUNT(*) FROM payments WHERE status IN ('approved','paid')").fetchone()[0]
     text = (
-        f"📊 <b>Статистика бота</b>
-
-"
-        f"👥 Всего пользователей: {total}
-"
-        f"🟢 Активны сегодня: {active}
-"
-        f"🎁 Использовали триал: {trials}
-
-"
-        f"⏳ Ожидают подтверждения: {pend}
-"
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"🟢 Активны сегодня: {active}\n"
+        f"🎁 Использовали триал: {trials}\n\n"
+        f"⏳ Ожидают подтверждения: {pend}\n"
         f"✅ Успешных оплат: {paid}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
