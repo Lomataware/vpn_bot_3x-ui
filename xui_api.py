@@ -539,6 +539,7 @@ class XUIAPI:
                     logger.debug(f"3x-ui hysteria update ({path}): {e}")
             return False
 
+        last_err = None
         for tg_val in (int(user_id) if user_id else 0, str(user_id) if user_id else ""):
             hy_client["tgId"] = tg_val
             payload = {"id": hid, "settings": json.dumps({"clients": [hy_client]})}
@@ -547,18 +548,33 @@ class XUIAPI:
                 if res.get("success"):
                     return True
             except Exception as e:
+                last_err = e
                 logger.debug(f"3x-ui hysteria addClient attempt ({type(tg_val).__name__}): {e}")
 
-        # Фоллбэк для 3x-ui v3.x
-        try:
-            res = await self._request(
-                "POST", "/panel/api/clients/add",
-                json={"client": hy_client, "inboundIds": [hid]},
-            )
-            return bool(res.get("success"))
-        except Exception as e:
-            logger.warning(f"3x-ui: не удалось добавить Hysteria2-клиента {email}: {e}")
-            return False
+        # Фоллбэк для 3x-ui v3.x (/panel/api/clients/add): разные версии панели
+        # используют разные схемы тела запроса — пробуем их по очереди,
+        # пока одна не вернёт success=True.
+        hy_client["tgId"] = int(user_id) if user_id else 0
+        v3_payload_variants = [
+            # схема 1: объект клиента + массив инбаундов
+            {"client": hy_client, "inboundIds": [hid]},
+            # схема 2: плоский объект клиента с числовым inboundId
+            {**hy_client, "inboundId": hid},
+            # схема 3: flat + строковый id (некоторые сборки требуют string)
+            {**hy_client, "inboundId": str(hid)},
+        ]
+        for vp in v3_payload_variants:
+            try:
+                res = await self._request("POST", "/panel/api/clients/add", json=vp)
+                if res.get("success"):
+                    return True
+                last_err = RuntimeError(res.get("msg") or "clients/add rejected")
+            except Exception as e:
+                last_err = e
+                logger.debug(f"3x-ui hysteria clients/add variant attempt: {e}")
+
+        logger.warning(f"3x-ui: не удалось добавить Hysteria2-клиента {email}: {last_err}")
+        return False
 
     async def _get_hysteria_password(self, email: str) -> str | None:
         """Возвращает пароль существующего Hysteria2-клиента (чтобы не менять его при продлении)."""
