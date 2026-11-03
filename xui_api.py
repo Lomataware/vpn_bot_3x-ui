@@ -352,15 +352,29 @@ class XUIAPI:
 
         other_protos = ("vless", "trojan", "shadowsocks", "vmess", "wireguard", "dokodemo-door")
 
+        # Получаем полный список инбаундов один раз — он надёжнее точечного get-by-id
+        # (некоторые версии 3x-ui возвращают пустой/урезанный объект из /inbounds/get/{id})
         # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
-        if self.hysteria_inbound_id:
+        list_error = None
+        inb_list: list[dict] = []
+        try:
+            inb_list = await self._list_inbounds()
+        except Exception as e:
+            list_error = e
+            logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
+
+        # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
+        if self.hysteria_inbound_id and not list_error:
             hid = self.hysteria_inbound_id
-            obj = {}
-            try:
-                res = await self._request("GET", f"/panel/api/inbounds/get/{hid}")
-                obj = self._normalize_inbound(res.get("obj") or {})
-            except Exception as e:
-                logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
+            obj = next((i for i in inb_list if i.get("id") == hid), None)
+            if obj is None:
+                # fallback: точечный запрос, если по какой-то причине нет в списке
+                try:
+                    res = await self._request("GET", f"/panel/api/inbounds/get/{hid}")
+                    obj = self._normalize_inbound(res.get("obj") or {})
+                except Exception as e:
+                    logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
+                    obj = {}
 
             proto = (obj.get("protocol") or "").lower()
             if self._is_hysteria(obj):
@@ -375,12 +389,11 @@ class XUIAPI:
             # иначе (пустой ответ / неизвестный протокол) — переходим к поиску по списку
 
         # 2. Поиск любого hysteria-инбаунда в списке панели
-        try:
+        if not list_error:
             found = await self._find_hysteria_in_list()
             if found:
                 return found
-        except Exception as e:
-            logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
+        else:
             return None
 
         # 3. Авто-создание
