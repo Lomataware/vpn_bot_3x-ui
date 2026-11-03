@@ -7,7 +7,7 @@ from telegram.ext import (
 from config import Config
 from database import init_db
 from handlers import (
-    start, handle_button, handle_message,
+    start, handle_button, handle_message, help_command,
     stats_command, issue_command, approve_command, pending_command,
     broadcast_command, diag_command, sync_hy_command, error_handler
 )
@@ -45,11 +45,18 @@ def main():
         return
     if not Config.XUI_URL:
         logger.warning("Не задан XUI_URL в .env файле!")
+    if Config.ADMIN_ID == 0:
+        logger.warning(
+            "ВНИМАНИЕ: ADMIN_ID не задан (равен 0)! Админ-команды (/issue, /approve, "
+            "/pending, /broadcast, /stats, /diag, /synchy) работать не будут. "
+            "Укажите свой Telegram ID в .env"
+        )
 
     init_db()
 
     app = Application.builder().token(Config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("issue", issue_command))
     app.add_handler(CommandHandler("approve", approve_command))

@@ -545,6 +545,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Главное меню:", reply_markup=_menu_for_user(user.id))
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Справка по командам. Показывает админ-команды только админам."""
+    is_adm = Config.is_admin(update.effective_user.id)
+    lines = [
+        "ℹ️ <b>Команды бота:</b>",
+        "/start — главное меню",
+        "/help — эта справка",
+    ]
+    if is_adm:
+        lines += [
+            "",
+            "<b>Админ-команды:</b>",
+            "/issue &lt;user_id&gt; [дней] — выдать подписку",
+            "/approve &lt;payment_id&gt; — подтвердить оплату",
+            "/pending — ожидающие оплаты",
+            "/broadcast &lt;текст&gt; — рассылка",
+            "/stats — статистика",
+            "/diag — диагностика 3x-ui / Hysteria2",
+            "/synchy — синхронизировать клиентов с Hysteria2",
+        ]
+    elif Config.ADMIN_ID == 0:
+        lines.append(
+            "\n⚠️ В .env не задан <code>ADMIN_ID</code> — админ-команды отключены. "
+            "Укажите свой Telegram ID (узнать: @userinfobot) и перезапустите бота."
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not Config.is_admin(update.effective_user.id):
         return
