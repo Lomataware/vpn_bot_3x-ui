@@ -565,5 +565,36 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Диагностика Hysteria2 для админа: /diag — состояние инбаундов и клиентов."""
+    if not Config.is_admin(update.effective_user.id):
+        return
+    lines = await xui.diagnose_hysteria()
+    text = "🩺 <b>Диагностика 3x-ui / Hysteria2</b>\n\n" + "\n".join(
+        f"<code>{l}</code>" for l in lines
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def sync_hy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная синхронизация всех клиентов с Hysteria2-инбаундом: /synchy"""
+    if not Config.is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("⏳ Синхронизирую клиентов с Hysteria2-инбаундом...")
+    res = await xui.sync_all_hysteria_clients()
+    if res.get("error"):
+        await update.message.reply_text(f"❌ {res['error']}")
+        return
+    text = (
+        "🔄 <b>Синхронизация Hysteria2 завершена</b>\n\n"
+        f"Инбаунд ID: {res['hysteria_inbound']}\n"
+        f"Проверено клиентов: {res['checked']}\n"
+        f"Добавлено новых: {res['added']}\n"
+        f"Обновлено: {res['updated']}\n"
+        f"Ошибок: {res['failed']}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Exception: {context.error}", exc_info=context.error)

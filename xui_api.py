@@ -305,29 +305,79 @@ class XUIAPI:
         # В 3x-ui v3 список может быть вложен в {"inbounds": [...]}
         if isinstance(inbounds, dict):
             inbounds = inbounds.get("inbounds") or inbounds.get("data") or []
-        return inbounds
+        return [self._normalize_inbound(i) for i in inbounds]
+
+    async def _find_hysteria_in_list(self) -> dict | None:
+        """Ищет hysteria2-инбаунд (в т.ч. с 'hysteria' в remark) в списке панели."""
+        for inb in await self._list_inbounds():
+            proto = (inb.get("protocol") or "").lower()
+            remark = (inb.get("remark") or "").lower()
+            if proto == "hysteria2" or (proto.startswith("hysteria") and "2" in proto):
+                self.hysteria_inbound_id = inb.get("id")
+                logger.info(f"3x-ui: найден Hysteria2-инбаунд ID={inb.get('id')} ({inb.get('remark')})")
+                return inb
+        for inb in await self._list_inbounds():
+            if "hysteria" in (inb.get("remark") or "").lower() and \
+               (inb.get("protocol") or "").lower() not in ("vless", "trojan", "shadowsocks"):
+                self.hysteria_inbound_id = inb.get("id")
+                return inb
+        return None
+
+    @staticmethod
+    def _normalize_inbound(obj: dict) -> dict:
+        """Приводит инбаунд из ответа API к единому виду (v2/v3)."""
+        if not isinstance(obj, dict):
+            return {}
+        inner = obj.get("inbound")
+        if isinstance(inner, dict):
+            merged = dict(inner)
+            merged.setdefault("clientStats", obj.get("clientStats"))
+            return merged
+        return obj
 
     async def get_hysteria_inbound(self) -> dict | None:
         """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui."""
         if not Config.XUI_ENABLE_HYSTERIA:
             return None
 
-        # 1. По явно заданному ID
+        # 1. По явно заданному ID (XUI_HYSTERIA_INBOUND_ID)
         if self.hysteria_inbound_id:
+            hid = self.hysteria_inbound_id
+            obj = {}
             try:
-                res = await self._request("GET", f"/panel/api/inbounds/get/{self.hysteria_inbound_id}")
-                obj = res.get("obj") or {}
-                if obj.get("protocol", "").lower() == "hysteria2":
-                    return obj
+                res = await self._request("GET", f"/panel/api/inbounds/get/{hid}")
+                obj = self._normalize_inbound(res.get("obj") or {})
             except Exception as e:
-                logger.debug(f"3x-ui: get hysteria inbound {self.hysteria_inbound_id}: {e}")
+                logger.debug(f"3x-ui: get hysteria inbound {hid}: {e}")
+
+            proto = (obj.get("protocol") or "").lower()
+            if proto == "hysteria2":
+                return obj
+            if proto:
+                logger.warning(
+                    f"3x-ui: XUI_HYSTERIA_INBOUND_ID={hid} указывает на инбаунд "
+                    f"протокола '{proto}', а не hysteria2 — игнорирую этот ID и ищу hysteria2-инбаунд сам"
+                )
+                self.hysteria_inbound_id = None
+            else:
+                # Инбаунд с таким ID не найден (пустой ответ / нет такого ID) —
+                # пробуем найти настоящий hysteria2-инбаунд в списке
+                try:
+                    found = await self._find_hysteria_in_list()
+                    if found:
+                        return found
+                    logger.warning(
+                        f"3x-ui: инбаунд с ID={hid} не найден и hysteria2-инбаундов в списке нет"
+                    )
+                except Exception as e:
+                    logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
+                    return None
 
         # 2. Поиск любого hysteria2-инбаунда в списке
         try:
-            for inb in await self._list_inbounds():
-                if (inb.get("protocol") or "").lower() == "hysteria2":
-                    self.hysteria_inbound_id = inb.get("id")
-                    return inb
+            found = await self._find_hysteria_in_list()
+            if found:
+                return found
         except Exception as e:
             logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
             return None
@@ -497,6 +547,96 @@ class XUIAPI:
             except Exception:
                 continue
 
+    async def sync_all_hysteria_clients(self) -> dict:
+        """Синхронизирует ВСЕ существующие клиенты VLESS-инбаунда с Hysteria2-инбаундом.
+
+        Вызывается при старте бота: старые подписки получают hysteria2-клиента
+        с тем же subId, после чего ссылка /sub/{subId} начинает отдавать vless+hysteria2.
+        """
+        result = {"checked": 0, "added": 0, "updated": 0, "failed": 0,
+                  "hysteria_inbound": None, "error": ""}
+        try:
+            hy_inbound = await self.get_hysteria_inbound()
+            if not hy_inbound:
+                result["error"] = "Hysteria2-инбаунд не найден и не может быть создан"
+                logger.warning("3x-ui sync: %s", result["error"])
+                return result
+            result["hysteria_inbound"] = hy_inbound.get("id")
+
+            vless_inbound = await self.get_inbound()
+            clients = _parse_json_field(vless_inbound.get("settings")).get("clients") or []
+            for c in clients:
+                email = c.get("email") or ""
+                if not email:
+                    continue
+                result["checked"] += 1
+                sub_id = c.get("subId") or secrets.token_hex(8)
+                expiry_ms = c.get("expiryTime") or 0
+                total_bytes = c.get("totalGB") or 0
+                tg_id = c.get("tgId") or 0
+                try:
+                    uid = int(tg_id) if str(tg_id).isdigit() else 0
+                except Exception:
+                    uid = 0
+                existing_hy = self._find_client_in_inbound(hy_inbound, email)
+                password = (existing_hy or {}).get("password") or secrets.token_urlsafe(18)
+                try:
+                    ok = await self._ensure_hysteria_client(
+                        email, password, expiry_ms, total_bytes, uid, sub_id
+                    )
+                    if ok:
+                        if existing_hy:
+                            result["updated"] += 1
+                        else:
+                            result["added"] += 1
+                            # обновим локальную копию инбаунда, чтобы не добавлять дважды
+                            hy_inbound.setdefault("_synced", []).append(email)
+                    else:
+                        result["failed"] += 1
+                        logger.warning(f"3x-ui sync: не удалось синхронизировать {email}")
+                except Exception as e:
+                    result["failed"] += 1
+                    logger.warning(f"3x-ui sync ({email}) error: {e}")
+
+            logger.info(
+                f"3x-ui sync Hysteria2: проверено={result['checked']} "
+                f"добавлено={result['added']} обновлено={result['updated']} ошибок={result['failed']}"
+            )
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"3x-ui sync_all_hysteria_clients error: {e}")
+        return result
+
+    async def diagnose_hysteria(self) -> list[str]:
+        """Возвращает список строк диагностики состояния Hysteria2 (для /diag у админа)."""
+        lines = []
+        try:
+            inbounds = await self._list_inbounds()
+            lines.append(f"Инбаунды в панели ({len(inbounds)}):")
+            for inb in inbounds:
+                n_clients = len(_parse_json_field(inb.get("settings")).get("clients") or [])
+                lines.append(
+                    f"  ID={inb.get('id')} proto={inb.get('protocol')} port={inb.get('port')} "
+                    f"remark='{inb.get('remark')}' enable={inb.get('enable')} clients={n_clients}"
+                )
+            hy = await self.get_hysteria_inbound()
+            if hy:
+                lines.append(f"Hysteria2-инбаунд: ID={hy.get('id')}, порт={hy.get('port')}, "
+                             f"enable={hy.get('enable')}")
+                stream = _parse_json_field(hy.get("streamSettings"))
+                tls = _parse_json_field(stream.get("tlsSettings"))
+                lines.append(f"  stream: network={stream.get('network')} security={stream.get('security')} "
+                             f"sni={tls.get('serverName')}")
+                hyc = _parse_json_field(hy.get("settings")).get("clients") or []
+                lines.append(f"  клиентов в Hysteria2: {len(hyc)}")
+            else:
+                lines.append("Hysteria2-инбаунд НЕ найден (XUI_ENABLE_HYSTERIA="
+                             f"{Config.XUI_ENABLE_HYSTERIA})")
+            lines.append(f"XUI_SUB_URL={Config.XUI_SUB_URL}")
+        except Exception as e:
+            lines.append(f"Ошибка диагностики: {e}")
+        return lines
+
     def _collect_result_links(self, vless_inbound: dict, hy_inbound: dict | None,
                               client_obj: dict, sub_id: str) -> dict:
         """Формирует набор ссылок для ответа боту: подписка (оба протокола) + прямые ключи."""
@@ -637,7 +777,7 @@ class XUIAPI:
         try:
             res = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
             if res.get("success") and res.get("obj"):
-                return res["obj"]
+                return self._normalize_inbound(res["obj"])
         except Exception as e:
             logger.warning(f"3x-ui get/{self.inbound_id} fallback to list: {e}")
 
