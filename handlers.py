@@ -32,12 +32,27 @@ def _menu_for_user(user_id: int):
 
 
 def _format_links_block(result: dict) -> str:
-    """Форматирует блок с прямым VLESS-ключом и ссылкой подписки (если задана)."""
+    """Форматирует блок со ссылками: подписка (vless+hysteria2) и прямые ключи."""
     main_url = result.get("subscription_url", "")
     sub_page = result.get("sub_page_url", "")
-    lines = f"🔗 <b>Ключ подключения:</b>\n<code>{main_url}</code>\n"
+    vless_link = result.get("vless_link", "")
+    hysteria_link = result.get("hysteria_link", "")
+
+    lines = ""
+    # Ссылка подписки — предпочтительный вариант: содержит сразу vless + hysteria2
+    if sub_page and sub_page == main_url:
+        lines += f"🌐 <b>Ссылка-подписка (VLESS + Hysteria2):</b>\n<code>{sub_page}</code>\n"
+    elif main_url:
+        lines += f"🔗 <b>Ключ подключения:</b>\n<code>{main_url}</code>\n"
+
     if sub_page and sub_page != main_url:
-        lines += f"\n🌐 <b>Ссылка на подписку (Sub URL):</b>\n<code>{sub_page}</code>\n"
+        lines += f"\n🌐 <b>Ссылка на подписку (Sub URL, VLESS + Hysteria2):</b>\n<code>{sub_page}</code>\n"
+
+    # Прямые ключи (для клиентов без поддержки подписок)
+    if vless_link:
+        lines += f"\n📡 <b>VLESS (Reality):</b>\n<code>{vless_link}</code>\n"
+    if hysteria_link:
+        lines += f"\n🚀 <b>Hysteria2 (QUIC):</b>\n<code>{hysteria_link}</code>\n"
     return lines
 
 

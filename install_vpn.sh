@@ -212,6 +212,81 @@ if [[ "$EXISTING_INBOUNDS" -eq 0 ]]; then
 else
   log "Инбаунд в 3x-ui уже существует, пропускаем создание."
 fi
+
+# ---------- 7b. Создание инбаунда Hysteria2 (443/udp) ------------------------
+log "Настройка инбаунда Hysteria2 в 3x-ui"
+HY_EXISTING="$(curl -s -k -b "$COOKIE_JAR" "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/list" \
+  | jq -r '[.obj[]? | select((.protocol // "") | ascii_downcase == "hysteria2")] | length' 2>/dev/null || echo "0")"
+if [[ ! "$HY_EXISTING" =~ ^[0-9]+$ ]]; then
+  HY_EXISTING=0
+fi
+
+if [[ "$HY_EXISTING" -eq 0 ]]; then
+  HY_SETTINGS_JSON="$(jq -cn '{clients: []}')"
+  if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
+    HY_STREAM_JSON="$(jq -cn \
+      --arg cert "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" \
+      --arg key  "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" \
+      --arg sni  "${DOMAIN}" \
+      '{
+        network: "raw",
+        security: "tls",
+        externalProxy: [],
+        tlsSettings: {
+          serverName: $sni,
+          alpn: ["h3"],
+          certificates: [{certFile: $cert, keyFile: $key}],
+          rejectUnknownCert: false,
+          maxVersion: "1.3",
+          minVersion: "1.2"
+        }
+      }')"
+  else
+    warn "Нет TLS-сертификата — создаю Hysteria2 с самоподписанным сертификатом (клиенты подключаются с insecure=1)."
+    HY_STREAM_JSON="$(jq -cn \
+      --arg sni "${DOMAIN}" \
+      '{
+        network: "raw",
+        security: "tls",
+        externalProxy: [],
+        tlsSettings: {
+          serverName: $sni,
+          alpn: ["h3"],
+          rejectUnknownCert: true,
+          insecure: true,
+          maxVersion: "1.3",
+          minVersion: "1.2"
+        }
+      }')"
+  fi
+
+  HY_INBOUND_PAYLOAD="$(jq -n \
+    --arg remark "${SERVER_LABEL}-Hysteria2" \
+    --arg settings "$HY_SETTINGS_JSON" \
+    --arg streamSettings "$HY_STREAM_JSON" \
+    '{
+      up: 0,
+      down: 0,
+      total: 0,
+      remark: $remark,
+      enable: true,
+      expiryTime: 0,
+      listen: "",
+      port: 443,
+      protocol: "hysteria2",
+      settings: $settings,
+      streamSettings: $streamSettings,
+      sniffing: "{\"enabled\": false}"
+    }')"
+
+  curl -s -k -b "$COOKIE_JAR" -X POST "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/add" \
+    -H "Content-Type: application/json" \
+    -H "X-CSRF-Token: ${CSRF_TOKEN}" \
+    -d "$HY_INBOUND_PAYLOAD" >/dev/null || warn "Не удалось создать Hysteria2-инбаунд через curl (бот создаст его автоматически при первом запросе)"
+  log "Инбаунд Hysteria2 (порт 443/udp) настроен!"
+else
+  log "Hysteria2-инбаунд уже существует, пропускаем создание."
+fi
 rm -f "$COOKIE_JAR"
 
 # ---------- 8. Установка Telegram-бота ---------------------------------------
