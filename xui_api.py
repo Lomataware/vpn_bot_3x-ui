@@ -36,6 +36,7 @@ class XUIAPI:
         self.username = Config.XUI_USERNAME
         self.password = Config.XUI_PASSWORD
         self.inbound_id = Config.XUI_INBOUND_ID
+        self.hysteria_inbound_id = Config.XUI_HYSTERIA_INBOUND_ID or None
         self.cookies = {}
         self.csrf_token = None
         self.cookie_expires = None
@@ -260,9 +261,20 @@ class XUIAPI:
 
         elif protocol == "hysteria2":
             password = client.get("password") or client.get("id") or ""
-            tls_settings = stream.get("tlsSettings") or {}
-            sni = tls_settings.get("serverName") or host
-            return f"hysteria2://{quote(str(password))}@{host}:{port}?sni={quote(str(sni))}&insecure=0#{remark}"
+            params = []
+            if security == "tls":
+                tls_settings = _parse_json_field(stream.get("tlsSettings"))
+                server_name = tls_settings.get("serverName") or host
+                params.append(f"sni={quote(str(server_name))}")
+                alpn = tls_settings.get("alpn") or []
+                if alpn:
+                    params.append(f"alpn={quote(','.join(alpn))}")
+                if tls_settings.get("rejectUnknownCert") or tls_settings.get("insecure"):
+                    params.append("insecure=1")
+            query = "&".join(params)
+            sep = f"{query}&" if query else ""
+            # Пустой fragment в конце обязателен для корректного импорта ссылки
+            return f"hysteria2://{quote(str(password))}@{host}:{port}?{sep}#{remark}"
 
         elif protocol == "trojan":
             password = client.get("password") or client.get("id") or ""
@@ -272,14 +284,235 @@ class XUIAPI:
         return f"{self.base_url}/sub/{sub_id}" if sub_id else ""
 
     def _build_client_link(self, inbound: dict, client: dict) -> str:
-        """Возвращает основную ссылку (прямую vless:// или ссылку подписки XUI_SUB_URL)."""
-        direct_link = self._build_direct_link(inbound, client)
+        """Возвращает основную ссылку (ссылку подписки 3x-ui, если включен Sub-сервер).
+
+        Ссылка подписки вида {XUI_SUB_URL}/{subId} содержит ВСЕ протоколы клиента
+        (vless + hysteria2), поэтому при наличии subId она всегда в приоритете.
+        """
         sub_id = client.get("subId", "")
-        if direct_link.startswith(("vless://", "hysteria2://", "trojan://")):
-            return direct_link
         if Config.XUI_SUB_URL and sub_id:
             return f"{Config.XUI_SUB_URL}/{sub_id}"
+        direct_link = self._build_direct_link(inbound, client)
+        if direct_link.startswith(("vless://", "hysteria2://", "trojan://")):
+            return direct_link
         return direct_link
+
+    # ===== Hysteria2 (второй инбаунд) =========================================
+
+    async def _list_inbounds(self) -> list:
+        res = await self._request("GET", "/panel/api/inbounds/list")
+        inbounds = res.get("obj") or []
+        # В 3x-ui v3 список может быть вложен в {"inbounds": [...]}
+        if isinstance(inbounds, dict):
+            inbounds = inbounds.get("inbounds") or inbounds.get("data") or []
+        return inbounds
+
+    async def get_hysteria_inbound(self) -> dict | None:
+        """Находит (или автоматически создает) инбаунд Hysteria2 в панели 3x-ui."""
+        if not Config.XUI_ENABLE_HYSTERIA:
+            return None
+
+        # 1. По явно заданному ID
+        if self.hysteria_inbound_id:
+            try:
+                res = await self._request("GET", f"/panel/api/inbounds/get/{self.hysteria_inbound_id}")
+                obj = res.get("obj") or {}
+                if obj.get("protocol", "").lower() == "hysteria2":
+                    return obj
+            except Exception as e:
+                logger.debug(f"3x-ui: get hysteria inbound {self.hysteria_inbound_id}: {e}")
+
+        # 2. Поиск любого hysteria2-инбаунда в списке
+        try:
+            for inb in await self._list_inbounds():
+                if (inb.get("protocol") or "").lower() == "hysteria2":
+                    self.hysteria_inbound_id = inb.get("id")
+                    return inb
+        except Exception as e:
+            logger.warning(f"3x-ui: не удалось получить список инбаундов: {e}")
+            return None
+
+        # 3. Авто-создание
+        try:
+            return await self._auto_create_hysteria_inbound()
+        except Exception as e:
+            logger.warning(f"3x-ui: не удалось создать Hysteria2 инбаунд автоматически: {e}")
+            return None
+
+    async def _auto_create_hysteria_inbound(self) -> dict | None:
+        """Создает инбаунд Hysteria2 (порт XUI_HYSTERIA_PORT/udp) с TLS-сертификатом панели."""
+        host = self._resolve_host()
+        cert_path = f"/etc/letsencrypt/live/{host}/fullchain.pem"
+        key_path = f"/etc/letsencrypt/live/{host}/privkey.pem"
+        has_cert = os.path.exists(cert_path) and os.path.exists(key_path)
+
+        settings_json = json.dumps({"clients": []})
+        if has_cert:
+            stream_json = json.dumps({
+                "network": "raw",
+                "security": "tls",
+                "externalProxy": [],
+                "tlsSettings": {
+                    "serverName": host,
+                    "alpn": ["h3"],
+                    "certificates": [{"certFile": cert_path, "keyFile": key_path}],
+                    "rejectUnknownCert": False,
+                    "maxVersion": "1.3",
+                    "minVersion": "1.2",
+                },
+            })
+        else:
+            # Без сертификата — самоподписанный режим (обязательно insecure=1 у клиента)
+            stream_json = json.dumps({
+                "network": "raw",
+                "security": "tls",
+                "externalProxy": [],
+                "tlsSettings": {
+                    "serverName": host,
+                    "alpn": ["h3"],
+                    "rejectUnknownCert": True,
+                    "insecure": True,
+                    "maxVersion": "1.3",
+                    "minVersion": "1.2",
+                },
+            })
+
+        payload = {
+            "up": 0,
+            "down": 0,
+            "total": 0,
+            "remark": f"{Config.SERVER_LABEL}-Hysteria2",
+            "enable": True,
+            "expiryTime": 0,
+            "listen": "",
+            "port": Config.XUI_HYSTERIA_PORT,
+            "protocol": "hysteria2",
+            "settings": settings_json,
+            "streamSettings": stream_json,
+            "sniffing": json.dumps({"enabled": False}),
+        }
+        res = await self._request("POST", "/panel/api/inbounds/add", json=payload)
+        if res.get("success"):
+            inb = res.get("obj") or {}
+            if not inb.get("id"):
+                # some versions return no object on add — find it via list
+                for inb_cand in await self._list_inbounds():
+                    if (inb_cand.get("protocol") or "").lower() == "hysteria2":
+                        inb = inb_cand
+                        break
+            self.hysteria_inbound_id = inb.get("id")
+            logger.info(f"3x-ui: автоматически создан инбаунд Hysteria2 (ID={self.hysteria_inbound_id})")
+            return inb
+        logger.warning(f"3x-ui: создание Hysteria2 инбаунда отклонено: {res.get('msg')}")
+        return None
+
+    async def _ensure_hysteria_client(self, email: str, password: str, expiry_ms: int,
+                                       total_bytes: int, user_id: int,
+                                       sub_id: str) -> bool:
+        """Добавляет/обновляет клиента в Hysteria2-инбаунде с тем же subId и паролем."""
+        inbound = await self.get_hysteria_inbound()
+        if not inbound:
+            return False
+
+        hy_client = {
+            "email": email,
+            "password": password,
+            "flow": "",
+            "limitIp": Config.LIMIT_IP,
+            "totalGB": total_bytes,
+            "expiryTime": expiry_ms,
+            "enable": True,
+            "tgId": int(user_id) if user_id else 0,
+            "subId": sub_id,
+            "comment": "",
+            "reset": 0,
+        }
+
+        existing = self._find_client_in_inbound(inbound, email)
+        hid = inbound.get("id", self.hysteria_inbound_id)
+        self.hysteria_inbound_id = hid
+
+        if existing:
+            updated = dict(existing)
+            updated.update({
+                "password": password,
+                "totalGB": total_bytes,
+                "expiryTime": expiry_ms,
+                "enable": True,
+                "subId": updated.get("subId") or sub_id,
+            })
+            payload = {"id": hid, "settings": json.dumps({"clients": [updated]})}
+            key = updated.get("password") or updated.get("id") or email
+            for path in (f"/panel/api/inbounds/updateClient/{quote(str(key))}",
+                         f"/panel/api/clients/update/{quote(email)}"):
+                try:
+                    res = await self._request("POST", path, json=payload if "inbounds" in path else updated)
+                    if res.get("success"):
+                        return True
+                except Exception as e:
+                    logger.debug(f"3x-ui hysteria update ({path}): {e}")
+            return False
+
+        for tg_val in (int(user_id) if user_id else 0, str(user_id) if user_id else ""):
+            hy_client["tgId"] = tg_val
+            payload = {"id": hid, "settings": json.dumps({"clients": [hy_client]})}
+            try:
+                res = await self._request("POST", "/panel/api/inbounds/addClient", json=payload)
+                if res.get("success"):
+                    return True
+            except Exception as e:
+                logger.debug(f"3x-ui hysteria addClient attempt ({type(tg_val).__name__}): {e}")
+
+        # Фоллбэк для 3x-ui v3.x
+        try:
+            res = await self._request(
+                "POST", "/panel/api/clients/add",
+                json={"client": hy_client, "inboundIds": [hid]},
+            )
+            return bool(res.get("success"))
+        except Exception as e:
+            logger.warning(f"3x-ui: не удалось добавить Hysteria2-клиента {email}: {e}")
+            return False
+
+    async def _get_hysteria_password(self, email: str) -> str | None:
+        """Возвращает пароль существующего Hysteria2-клиента (чтобы не менять его при продлении)."""
+        inbound = await self.get_hysteria_inbound()
+        if not inbound:
+            return None
+        client = self._find_client_in_inbound(inbound, email)
+        if client:
+            return client.get("password") or client.get("id")
+        return None
+
+    async def _try_reset_hysteria_traffic(self, email: str):
+        inbound = await self.get_hysteria_inbound()
+        if not inbound:
+            return
+        hid = inbound.get("id", self.hysteria_inbound_id)
+        for path in (f"/panel/api/inbounds/{hid}/resetClientTraffic/{quote(email)}",
+                     f"/panel/api/clients/resetTraffic/{quote(email)}"):
+            try:
+                await self._request("POST", path)
+                return
+            except Exception:
+                continue
+
+    def _collect_result_links(self, vless_inbound: dict, hy_inbound: dict | None,
+                              client_obj: dict, sub_id: str) -> dict:
+        """Формирует набор ссылок для ответа боту: подписка (оба протокола) + прямые ключи."""
+        main_url = self._build_client_link(vless_inbound, client_obj)
+        sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
+        vless_link = self._build_direct_link(vless_inbound, client_obj)
+        hysteria_link = ""
+        if hy_inbound:
+            hysteria_link = self._build_direct_link(hy_inbound, client_obj)
+        return {
+            "subscription_url": main_url,
+            "sub_page_url": sub_page_url,
+            "vless_link": vless_link if vless_link.startswith("vless://") else "",
+            "hysteria_link": hysteria_link if hysteria_link.startswith("hysteria2://") else "",
+        }
+
 
     async def _generate_x25519_keys(self) -> tuple[str, str]:
         """Генерирует пару ключей X25519 через API 3x-ui или бинарник xray."""
@@ -475,6 +708,15 @@ class XUIAPI:
             sub_id = client.get("subId", "")
             sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
 
+            # Прямые ссылки vless + hysteria2 (гистерия-клиент с тем же subId/email)
+            vless_link = self._build_direct_link(inbound, client)
+            hysteria_link = ""
+            hy_inbound = await self.get_hysteria_inbound()
+            if hy_inbound:
+                hy_client = self._find_client_in_inbound(hy_inbound, email)
+                if hy_client:
+                    hysteria_link = self._build_direct_link(hy_inbound, hy_client)
+
             return {
                 "success": True,
                 "data": {
@@ -489,6 +731,8 @@ class XUIAPI:
                 },
                 "subscription_url": sub_url,
                 "sub_page_url": sub_page_url,
+                "vless_link": vless_link if vless_link.startswith("vless://") else "",
+                "hysteria_link": hysteria_link,
             }
         except Exception as e:
             logger.error(f"3x-ui get_user({email}) error: {e}")
@@ -562,18 +806,33 @@ class XUIAPI:
             try:
                 res = await self._post_update_client(client_uuid, email, updated_client, user_id)
                 if res.get("success"):
-                    inbound = await self.get_inbound()
-                    sub_url = self._build_client_link(inbound, updated_client)
                     sub_id = updated_client.get("subId", "")
-                    sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
-                    logger.info(f"3x-ui: продлена подписка {email} на {days} дн.")
+
+                    # Синхронизируем клиента с Hysteria2-инбаундом (тот же subId -> обе ссылки в подписке)
+                    hy_password = await self._get_hysteria_password(email) or secrets.token_urlsafe(18)
+                    hy_ok = False
+                    try:
+                        hy_ok = await self._ensure_hysteria_client(
+                            email, hy_password, new_expire_ms, total_bytes, user_id, sub_id
+                        )
+                        if hy_ok:
+                            await self._try_reset_hysteria_traffic(email)
+                    except Exception as he:
+                        logger.warning(f"3x-ui: не удалось синхронизировать Hysteria2-клиента {email}: {he}")
+
+                    inbound = await self.get_inbound()
+                    hy_inbound = await self.get_hysteria_inbound() if hy_ok else None
+                    link_client = dict(updated_client)
+                    link_client["password"] = hy_password
+                    links = self._collect_result_links(inbound, hy_inbound, link_client, sub_id)
+
+                    logger.info(f"3x-ui: продлена подписка {email} на {days} дн. (hysteria2: {'OK' if hy_ok else 'нет'})")
                     return {
                         "success": True,
                         "username": email,
                         "uuid": client_uuid,
                         "sub_id": sub_id,
-                        "subscription_url": sub_url,
-                        "sub_page_url": sub_page_url,
+                        **links,
                         "expire": new_expire_sec,
                         "data_limit": total_bytes,
                         "extended": True,
@@ -647,16 +906,32 @@ class XUIAPI:
                         raise v3_err
 
             if res and res.get("success"):
-                sub_url = self._build_client_link(inbound, client_obj)
-                sub_page_url = f"{Config.XUI_SUB_URL}/{sub_id}" if (Config.XUI_SUB_URL and sub_id) else ""
-                logger.info(f"3x-ui: создан клиент {email} (UUID={client_uuid})")
+                # Добавляем того же клиента в Hysteria2-инбаунд с тем же subId,
+                # чтобы в подписке 3x-ui отдавались обе ссылки: vless + hysteria2.
+                hy_password = secrets.token_urlsafe(18)
+                hy_ok = False
+                try:
+                    hy_ok = await self._ensure_hysteria_client(
+                        email, hy_password, expire_ms, total_bytes, user_id, sub_id
+                    )
+                except Exception as he:
+                    logger.warning(f"3x-ui: не удалось создать Hysteria2-клиента {email}: {he}")
+
+                hy_inbound = await self.get_hysteria_inbound() if hy_ok else None
+                link_client = dict(client_obj)
+                link_client["password"] = hy_password
+                links = self._collect_result_links(inbound, hy_inbound, link_client, sub_id)
+
+                logger.info(
+                    f"3x-ui: создан клиент {email} (UUID={client_uuid}, "
+                    f"hysteria2: {'OK' if hy_ok else 'нет'})"
+                )
                 return {
                     "success": True,
                     "username": email,
                     "uuid": client_uuid,
                     "sub_id": sub_id,
-                    "subscription_url": sub_url,
-                    "sub_page_url": sub_page_url,
+                    **links,
                     "expire": expire_sec,
                     "data_limit": total_bytes,
                     "extended": False,
@@ -668,7 +943,7 @@ class XUIAPI:
             return {"success": False, "error": str(e)}
 
     async def revoke_subscription(self, email: str) -> bool:
-        """Отключает клиента в 3x-ui."""
+        """Отключает клиента в 3x-ui (включая Hysteria2-инбаунд)."""
         try:
             user_res = await self.get_user(email)
             if not user_res["success"]:
@@ -680,6 +955,29 @@ class XUIAPI:
             res = await self._post_update_client(
                 client_uuid, email, raw_client, int(tg_id) if str(tg_id).isdigit() else 0
             )
+
+            # Отключаем того же клиента и в Hysteria2-инбаунде
+            try:
+                hy_inbound = await self.get_hysteria_inbound()
+                if hy_inbound:
+                    hy_client = self._find_client_in_inbound(hy_inbound, email)
+                    if hy_client:
+                        hid = hy_inbound.get("id", self.hysteria_inbound_id)
+                        disabled = dict(hy_client)
+                        disabled["enable"] = False
+                        payload = {"id": hid, "settings": json.dumps({"clients": [disabled]})}
+                        key = disabled.get("password") or disabled.get("id") or email
+                        try:
+                            await self._request(
+                                "POST", f"/panel/api/inbounds/updateClient/{quote(str(key))}", json=payload
+                            )
+                        except Exception:
+                            await self._request(
+                                "POST", f"/panel/api/clients/update/{quote(email)}", json=disabled
+                            )
+            except Exception as he:
+                logger.warning(f"3x-ui: не удалось отключить Hysteria2-клиента {email}: {he}")
+
             return bool(res.get("success"))
         except Exception as e:
             logger.error(f"3x-ui revoke error ({email}): {e}")

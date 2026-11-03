@@ -19,6 +19,10 @@ class Config:
     XUI_USERNAME = os.getenv("XUI_USERNAME", "admin")
     XUI_PASSWORD = os.getenv("XUI_PASSWORD", "")
     XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "1"))
+    # Дополнительный инбаунд Hysteria2 (0 = искать/создавать автоматически)
+    XUI_HYSTERIA_INBOUND_ID = int(os.getenv("XUI_HYSTERIA_INBOUND_ID", "0"))
+    XUI_HYSTERIA_PORT = int(os.getenv("XUI_HYSTERIA_PORT", "443"))
+    XUI_ENABLE_HYSTERIA = os.getenv("XUI_ENABLE_HYSTERIA", "true").lower() == "true"
     XUI_PUBLIC_HOST = os.getenv("XUI_PUBLIC_HOST", "")
     XUI_SUB_URL = os.getenv("XUI_SUB_URL", "").rstrip("/")
     DEFAULT_DATA_LIMIT_GB = int(os.getenv("DEFAULT_DATA_LIMIT_GB", "100"))
