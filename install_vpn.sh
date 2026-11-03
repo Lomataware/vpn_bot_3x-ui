@@ -216,7 +216,7 @@ fi
 # ---------- 7b. Создание инбаунда Hysteria2 (443/udp) ------------------------
 log "Настройка инбаунда Hysteria2 в 3x-ui"
 HY_EXISTING="$(curl -s -k -b "$COOKIE_JAR" "${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}/panel/api/inbounds/list" \
-  | jq -r '[.obj[]? | select((.protocol // "") | ascii_downcase == "hysteria2")] | length' 2>/dev/null || echo "0")"
+  | jq -r '[.obj[]? | select((.protocol // "") | ascii_downcase | startswith("hysteria"))] | length' 2>/dev/null || echo "0")"
 if [[ ! "$HY_EXISTING" =~ ^[0-9]+$ ]]; then
   HY_EXISTING=0
 fi
