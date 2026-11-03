@@ -322,6 +322,11 @@ XUI_URL=${PROTOCOL_SCHEME}://127.0.0.1:${XUI_PORT}
 XUI_USERNAME=${XUI_ADMIN_USER}
 XUI_PASSWORD=${XUI_ADMIN_PASS}
 XUI_INBOUND_ID=1
+# Hysteria2: 0 = бот сам найдет/создаст инбаунд (рекомендуется).
+# Указывать конкретный ID только если точно знаете ID hysteria2-инбаунда в панели.
+XUI_ENABLE_HYSTERIA=true
+XUI_HYSTERIA_INBOUND_ID=0
+XUI_HYSTERIA_PORT=443
 XUI_PUBLIC_HOST=${DOMAIN}
 XUI_SUB_URL=${PROTOCOL_SCHEME}://${DOMAIN}:${XUI_SUB_PORT}/sub
 DEFAULT_DATA_LIMIT_GB=100
